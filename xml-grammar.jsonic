@@ -1,0 +1,41 @@
+# XML Grammar Definition (simple element-only version)
+# Parsed by a standard Jsonic instance and passed to jsonic.grammar()
+# Function references (@ prefixed) are resolved against the refs map
+#
+# Token naming:
+#   #XOP - XML open tag, e.g. <tagname>
+#   #XCL - XML close tag, e.g. </tagname>
+#   #XSC - XML self-close tag, e.g. <tagname/>
+#   #TX  - text content between tags
+#   #ZZ  - end of input
+
+{
+  rule: xml: open: [
+    { s: '#ZZ' }
+    { p: element }
+  ]
+
+  rule: element: open: [
+    { s: '#XSC' a: '@element-selfclose' u: { selfclose: 1 } }
+    { s: '#XOP' p: content a: '@element-open' }
+  ]
+  rule: element: close: [
+    { c: '@element-is-selfclosed' }
+    { s: '#XCL' a: '@element-close' }
+  ]
+
+  rule: content: open: [
+    { s: '#XCL' b: 1 }
+    { p: child }
+  ]
+  rule: content: close: [
+    { s: '#XCL' b: 1 }
+    { r: content }
+  ]
+
+  rule: child: open: [
+    { s: '#TX' a: '@child-text' }
+    { s: '#XOP' b: 1 p: element }
+    { s: '#XSC' b: 1 p: element }
+  ]
+}
