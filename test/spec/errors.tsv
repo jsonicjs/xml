@@ -1,0 +1,10 @@
+# name	input	expected	opts
+# Inputs that must raise a parse error. `expected` uses the literal token
+# "ERROR" (optionally ":code" for a specific error code) to indicate that
+# parsing must fail.
+
+mismatched-close	<a></b>	ERROR:xml_mismatched_tag
+unterminated-comment	<a><!-- unterminated	ERROR
+unterminated-cdata	<a><![CDATA[unterminated	ERROR
+unterminated-pi	<a><?target data	ERROR
+unterminated-tag	<a x="unterminated	ERROR
