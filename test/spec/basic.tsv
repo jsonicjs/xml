@@ -25,3 +25,5 @@ multiline	<root>\n  <a>1</a>\n  <b>2</b>\n</root>	{"name":"root","localName":"ro
 tag-name-dash	<a-b>x</a-b>	{"name":"a-b","localName":"a-b","attributes":{},"children":["x"]}
 tag-name-dot	<a.b>x</a.b>	{"name":"a.b","localName":"a.b","attributes":{},"children":["x"]}
 tag-name-underscore	<a_b>x</a_b>	{"name":"a_b","localName":"a_b","attributes":{},"children":["x"]}
+tag-name-unicode-thai	<เจมส์>x</เจมส์>	{"name":"เจมส์","localName":"เจมส์","attributes":{},"children":["x"]}
+tag-name-unicode-greek	<Ωmega>x</Ωmega>	{"name":"Ωmega","localName":"Ωmega","attributes":{},"children":["x"]}

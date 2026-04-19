@@ -356,12 +356,33 @@ function buildXmlTagMatcher(
   embed: boolean,
   options: XmlOptions,
 ) {
-  const isNameStart = (ch: string) =>
-    /[A-Za-z_:]/.test(ch)
-  const isNameChar = (ch: string) =>
-    /[A-Za-z0-9_\-\.:]/.test(ch)
+  // Backwards-compatible single-char predicates retained for sites that
+  // only need a simple character class check (e.g. peek before reading
+  // a name). Multi-byte / surrogate pair handling is in `readName` /
+  // `cpAt` below.
+  const isNameStart = (ch: string) => isNameStartCP(ch.codePointAt(0)!)
+  const isNameChar = (ch: string) => isNameCharCP(ch.codePointAt(0)!)
   const isSpace = (ch: string) =>
     ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r'
+
+  // Read an XML Name starting at `start`. Returns the name and the
+  // index after it, or null if the character at `start` is not a
+  // valid NameStartChar. Handles UTF-16 surrogate pairs so non-BMP
+  // code points are treated as single characters. Typed `any` so the
+  // matcher's `lex.src` (declared as the boxed `String` upstream)
+  // can be passed in without a cast.
+  function readName(src: any, start: number): { name: string; end: number } | null {
+    if (start >= src.length) return null
+    const cp0 = src.codePointAt(start)!
+    if (!isNameStartCP(cp0)) return null
+    let i = start + (cp0 > 0xffff ? 2 : 1)
+    while (i < src.length) {
+      const cp = src.codePointAt(i)!
+      if (!isNameCharCP(cp)) break
+      i += cp > 0xffff ? 2 : 1
+    }
+    return { name: String(src).substring(start, i), end: i }
+  }
 
   // Validate and decode a run of character data (non-CDATA). Enforces
   // the XML 1.0 well-formedness constraints applicable to text:
@@ -481,12 +502,11 @@ function buildXmlTagMatcher(
           return lex.bad('unterminated_pi', sI, src.length)
         }
         // WF constraint: PI target must be a Name (and not empty).
-        let i = sI + 2
-        if (i >= src.length || !isNameStart(src[i])) {
+        const piTargetRes = readName(src, sI + 2)
+        if (piTargetRes == null || piTargetRes.end > endIdx) {
           return lex.bad('pi_target_invalid', sI, endIdx + 2)
         }
-        i++
-        while (i < endIdx && isNameChar(src[i])) i++
+        const i = piTargetRes.end
         // After the target, only whitespace then content is allowed.
         if (i < endIdx && !isSpace(src[i])) {
           return lex.bad('pi_target_invalid', sI, endIdx + 2)
@@ -503,15 +523,13 @@ function buildXmlTagMatcher(
 
       // Closing tag: </name>
       if (src[sI + 1] === '/') {
-        let i = sI + 2
+        const nameRes = readName(src, sI + 2)
         // WF: empty close tag `</>` is invalid.
-        if (i >= src.length || !isNameStart(src[i])) {
-          return lex.bad('xml_invalid_tag', sI, Math.min(src.length, i + 1))
+        if (nameRes == null) {
+          return lex.bad('xml_invalid_tag', sI, Math.min(src.length, sI + 3))
         }
-        const nameStart = i
-        i++
-        while (i < src.length && isNameChar(src[i])) i++
-        const name = src.substring(nameStart, i)
+        const name = nameRes.name
+        let i = nameRes.end
         while (i < src.length && isSpace(src[i])) i++
         if (src[i] !== '>') {
           return lex.bad('xml_invalid_tag', sI, i + 1)
@@ -528,12 +546,10 @@ function buildXmlTagMatcher(
       }
 
       // Opening or self-close tag: <name attr="v" .../>
-      let i = sI + 1
-      const nameStart = i
-      if (i >= src.length || !isNameStart(src[i])) return undefined
-      i++
-      while (i < src.length && isNameChar(src[i])) i++
-      const name = src.substring(nameStart, i)
+      const elemNameRes = readName(src, sI + 1)
+      if (elemNameRes == null) return undefined
+      const name = elemNameRes.name
+      let i = elemNameRes.end
       const attributes: Record<string, string> = {}
 
       while (true) {
@@ -567,13 +583,12 @@ function buildXmlTagMatcher(
           return lex.bad('xml_invalid_tag', sI, i + 1)
         }
 
-        if (!isNameStart(src[i])) {
+        const attrNameRes = readName(src, i)
+        if (attrNameRes == null) {
           return lex.bad('xml_invalid_tag', sI, i + 1)
         }
-        const attrStart = i
-        i++
-        while (i < src.length && isNameChar(src[i])) i++
-        const attrName = src.substring(attrStart, i)
+        const attrName = attrNameRes.name
+        i = attrNameRes.end
 
         while (i < src.length && isSpace(src[i])) i++
         if (src[i] !== '=') {
@@ -621,6 +636,39 @@ function buildXmlTagMatcher(
 }
 
 
+// XML 1.0 Fifth Edition NameStartChar (§2.3 [4]). The non-Latin
+// ranges below cover the characters allowed at the start of an
+// element / attribute / entity / PI-target name.
+function isNameStartCP(cp: number): boolean {
+  return cp === 0x3a || // ':'
+    cp === 0x5f ||      // '_'
+    (cp >= 0x41 && cp <= 0x5a) ||
+    (cp >= 0x61 && cp <= 0x7a) ||
+    (cp >= 0xc0 && cp <= 0xd6) ||
+    (cp >= 0xd8 && cp <= 0xf6) ||
+    (cp >= 0xf8 && cp <= 0x2ff) ||
+    (cp >= 0x370 && cp <= 0x37d) ||
+    (cp >= 0x37f && cp <= 0x1fff) ||
+    (cp >= 0x200c && cp <= 0x200d) ||
+    (cp >= 0x2070 && cp <= 0x218f) ||
+    (cp >= 0x2c00 && cp <= 0x2fef) ||
+    (cp >= 0x3001 && cp <= 0xd7ff) ||
+    (cp >= 0xf900 && cp <= 0xfdcf) ||
+    (cp >= 0xfdf0 && cp <= 0xfffd) ||
+    (cp >= 0x10000 && cp <= 0xeffff)
+}
+
+// XML 1.0 NameChar (§2.3 [4a]) — NameStartChar plus the digits,
+// hyphen, full stop, the middle dot and the combining-mark blocks.
+function isNameCharCP(cp: number): boolean {
+  return isNameStartCP(cp) ||
+    cp === 0x2d || cp === 0x2e || // '-' '.'
+    (cp >= 0x30 && cp <= 0x39) || // '0'-'9'
+    cp === 0xb7 ||
+    (cp >= 0x300 && cp <= 0x36f) ||
+    (cp >= 0x203f && cp <= 0x2040)
+}
+
 // Validate that every code unit in `s` is a legal XML 1.0 Char.
 // Returns 'invalid_xml_char' on the first illegal character, '' if all
 // characters are legal. Only the C0 control band is checked here; the
@@ -662,7 +710,18 @@ function checkEntityRefs(s: string): string {
         : /^[0-9]+$/.test(digits)
       if (!valid) return 'bad_entity_ref'
     } else {
-      if (!/^[A-Za-z_:][A-Za-z0-9_\-\.:]*$/.test(ref)) return 'bad_entity_ref'
+      // Entity name must be a Name (NameStartChar followed by NameChars).
+      let j = 0
+      const startCP = ref.codePointAt(0)
+      if (startCP === undefined || !isNameStartCP(startCP)) {
+        return 'bad_entity_ref'
+      }
+      j += startCP > 0xffff ? 2 : 1
+      while (j < ref.length) {
+        const cp = ref.codePointAt(j)!
+        if (!isNameCharCP(cp)) return 'bad_entity_ref'
+        j += cp > 0xffff ? 2 : 1
+      }
     }
     i = semi
   }

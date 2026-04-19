@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	jsonic "github.com/jsonicjs/jsonic/go"
 )
@@ -583,15 +584,11 @@ func buildXmlTagMatcher(
 				}
 				bodyEnd := sI + 2 + end
 				// WF: PI target must be a Name.
-				i := sI + 2
-				if i >= bodyEnd || !isNameStart(src[i]) {
+				_, after, ok := readName(src, sI+2)
+				if !ok || after > bodyEnd {
 					return lex.Bad("pi_target_invalid")
 				}
-				i++
-				for i < bodyEnd && isNameChar(src[i]) {
-					i++
-				}
-				if i < bodyEnd && !isSpace(src[i]) {
+				if after < bodyEnd && !isSpace(src[after]) {
 					return lex.Bad("pi_target_invalid")
 				}
 				if code := checkChars(src[sI+2 : bodyEnd]); code != "" {
@@ -606,17 +603,12 @@ func buildXmlTagMatcher(
 
 			// Closing tag: </name>
 			if sI+1 < srclen && src[sI+1] == '/' {
-				i := sI + 2
+				name, after, ok := readName(src, sI+2)
 				// WF: empty close tag `</>` is invalid.
-				if i >= srclen || !isNameStart(src[i]) {
+				if !ok {
 					return lex.Bad("xml_invalid_tag")
 				}
-				nameStart := i
-				i++
-				for i < srclen && isNameChar(src[i]) {
-					i++
-				}
-				name := src[nameStart:i]
+				i := after
 				for i < srclen && isSpace(src[i]) {
 					i++
 				}
@@ -632,16 +624,11 @@ func buildXmlTagMatcher(
 			}
 
 			// Opening or self-close tag: <name attr="v" ... />
-			i := sI + 1
-			if i >= srclen || !isNameStart(src[i]) {
+			name, after, ok := readName(src, sI+1)
+			if !ok {
 				return nil
 			}
-			nameStart := i
-			i++
-			for i < srclen && isNameChar(src[i]) {
-				i++
-			}
-			name := src[nameStart:i]
+			i := after
 			attrs := map[string]any{}
 
 			for {
@@ -679,15 +666,11 @@ func buildXmlTagMatcher(
 				}
 
 				// Attribute name.
-				if !isNameStart(src[i]) {
+				attrName, attrEnd, ok := readName(src, i)
+				if !ok {
 					return lex.Bad("xml_invalid_tag")
 				}
-				attrStart := i
-				i++
-				for i < srclen && isNameChar(src[i]) {
-					i++
-				}
-				attrName := src[attrStart:i]
+				i = attrEnd
 
 				for i < srclen && isSpace(src[i]) {
 					i++
@@ -804,13 +787,26 @@ func checkEntityRefs(s string) string {
 				}
 			}
 		} else {
-			if !isNameStart(ref[0]) {
+			// Entity name must be a Name. Use rune-aware checks so
+			// non-ASCII names (Unicode XML 1.0 NameStartChar / NameChar
+			// blocks) are accepted.
+			r0, sz := utf8.DecodeRuneInString(ref)
+			if r0 == utf8.RuneError && sz <= 1 {
 				return "bad_entity_ref"
 			}
-			for k := 1; k < len(ref); k++ {
-				if !isNameChar(ref[k]) {
+			if !isNameStartRune(r0) {
+				return "bad_entity_ref"
+			}
+			j := sz
+			for j < len(ref) {
+				r, sz := utf8.DecodeRuneInString(ref[j:])
+				if r == utf8.RuneError && sz <= 1 {
 					return "bad_entity_ref"
 				}
+				if !isNameCharRune(r) {
+					return "bad_entity_ref"
+				}
+				j += sz
 			}
 		}
 		i = semi
@@ -867,16 +863,84 @@ func advance(pnt *jsonic.Point, from, to int) {
 	pnt.CI += to - from
 }
 
-func isNameStart(ch byte) bool {
+// XML 1.0 Fifth Edition NameStartChar (§2.3 [4]): ASCII letters,
+// underscore, colon and a long list of Unicode letter / ideograph
+// blocks. Single-byte fast path for the common ASCII case.
+func isNameStartByte(ch byte) bool {
 	return (ch >= 'A' && ch <= 'Z') ||
 		(ch >= 'a' && ch <= 'z') ||
 		ch == '_' || ch == ':'
 }
 
-func isNameChar(ch byte) bool {
-	return isNameStart(ch) ||
+// Backwards-compat alias used by sites that only need to peek at the
+// next byte (entity ref check, etc.).
+func isNameStart(ch byte) bool { return isNameStartByte(ch) }
+
+func isNameStartRune(r rune) bool {
+	if r < 0x80 {
+		return isNameStartByte(byte(r))
+	}
+	return (r >= 0xc0 && r <= 0xd6) ||
+		(r >= 0xd8 && r <= 0xf6) ||
+		(r >= 0xf8 && r <= 0x2ff) ||
+		(r >= 0x370 && r <= 0x37d) ||
+		(r >= 0x37f && r <= 0x1fff) ||
+		(r >= 0x200c && r <= 0x200d) ||
+		(r >= 0x2070 && r <= 0x218f) ||
+		(r >= 0x2c00 && r <= 0x2fef) ||
+		(r >= 0x3001 && r <= 0xd7ff) ||
+		(r >= 0xf900 && r <= 0xfdcf) ||
+		(r >= 0xfdf0 && r <= 0xfffd) ||
+		(r >= 0x10000 && r <= 0xeffff)
+}
+
+func isNameCharByte(ch byte) bool {
+	return isNameStartByte(ch) ||
 		(ch >= '0' && ch <= '9') ||
 		ch == '-' || ch == '.'
+}
+
+func isNameChar(ch byte) bool { return isNameCharByte(ch) }
+
+func isNameCharRune(r rune) bool {
+	if r < 0x80 {
+		return isNameCharByte(byte(r))
+	}
+	if isNameStartRune(r) {
+		return true
+	}
+	return r == 0xb7 ||
+		(r >= 0x300 && r <= 0x36f) ||
+		(r >= 0x203f && r <= 0x2040)
+}
+
+// readName reads an XML Name starting at `start` from `src`. Returns
+// the name, the byte index after the name, and ok=false if the byte
+// at `start` does not begin a NameStartChar (including ASCII or any
+// of the Unicode ranges in §2.3 [4]).
+func readName(src string, start int) (name string, end int, ok bool) {
+	if start >= len(src) {
+		return "", start, false
+	}
+	r, sz := utf8.DecodeRuneInString(src[start:])
+	if r == utf8.RuneError && sz <= 1 {
+		return "", start, false
+	}
+	if !isNameStartRune(r) {
+		return "", start, false
+	}
+	i := start + sz
+	for i < len(src) {
+		r, sz := utf8.DecodeRuneInString(src[i:])
+		if r == utf8.RuneError && sz <= 1 {
+			break
+		}
+		if !isNameCharRune(r) {
+			break
+		}
+		i += sz
+	}
+	return src[start:i], i, true
 }
 
 func isSpace(ch byte) bool {
