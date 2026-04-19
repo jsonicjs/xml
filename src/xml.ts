@@ -239,22 +239,22 @@ Expected </$openname> but found </$fsrc>.`,
     // document hasn't already produced a root (XML 1.0 §2.1).
     '@no-root-yet': (_r: Rule, ctx: Context) => true !== ctx.u.rootSeen,
 
-    '@element-open': (r: Rule) => {
+    '@element-open': (r: Rule, ctx: Context) => {
       const v = r.o0.val
       r.node = {
         name: v.name,
         localName: v.name,
-        attributes: v.attributes,
+        attributes: applyAttrDefaults(v.attributes, v.name, ctx),
         children: [],
       }
     },
 
-    '@element-selfclose': (r: Rule) => {
+    '@element-selfclose': (r: Rule, ctx: Context) => {
       const v = r.o0.val
       r.node = {
         name: v.name,
         localName: v.name,
-        attributes: v.attributes,
+        attributes: applyAttrDefaults(v.attributes, v.name, ctx),
         children: [],
       }
     },
@@ -522,6 +522,133 @@ type DecodeEntitiesFn = ((src: string, dtd?: Record<string, string>) => string) 
 }
 
 // Parse the body of a DOCTYPE declaration (the text between the `[`
+// and `]` of the internal subset) and extract every `<!ATTLIST>`
+// declaration's default attribute values, keyed by element name and
+// attribute name. Both literal defaults and `#FIXED "value"` defaults
+// are returned; `#REQUIRED` and `#IMPLIED` declarations contribute
+// nothing because they have no default value.
+//
+// Used by the matcher's element actions to fill in attributes that
+// were not present on the element instance.
+function parseDoctypeAttlists(body: string): Record<string, Record<string, string>> {
+  const isSpace = (ch: string) =>
+    ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r'
+  const isUpperAscii = (ch: string) =>
+    ch >= 'A' && ch <= 'Z'
+  const skipSpace = (s: number): number => {
+    while (s < body.length && isSpace(body[s])) s++
+    return s
+  }
+  const out: Record<string, Record<string, string>> = {}
+
+  let i = 0
+  while (i < body.length) {
+    const idx = body.indexOf('<!ATTLIST', i)
+    if (idx < 0) break
+    let j = idx + '<!ATTLIST'.length
+    j = skipSpace(j)
+    const elemName = readNameInBody(body, j)
+    if (!elemName) { i = j + 1; continue }
+    j = elemName.end
+
+    // Loop over AttDefs until '>' or EOF.
+    while (j < body.length) {
+      j = skipSpace(j)
+      if (j >= body.length) break
+      if (body[j] === '>') { j++; break }
+
+      const attrName = readNameInBody(body, j)
+      if (!attrName) { j++; continue }
+      j = attrName.end
+      j = skipSpace(j)
+
+      // Skip AttType: enumeration `( ... )`, `NOTATION ( ... )`, or
+      // a bare type identifier (CDATA, ID, IDREF, IDREFS, NMTOKEN,
+      // NMTOKENS, ENTITY, ENTITIES).
+      if (body[j] === '(') {
+        const close = body.indexOf(')', j)
+        if (close < 0) { j = body.length; break }
+        j = close + 1
+      } else if (body.startsWith('NOTATION', j)) {
+        j += 'NOTATION'.length
+        j = skipSpace(j)
+        if (body[j] === '(') {
+          const close = body.indexOf(')', j)
+          if (close < 0) { j = body.length; break }
+          j = close + 1
+        }
+      } else {
+        while (j < body.length && isUpperAscii(body[j])) j++
+      }
+      j = skipSpace(j)
+
+      // DefaultDecl.
+      if (body.startsWith('#REQUIRED', j)) {
+        j += '#REQUIRED'.length
+        continue
+      }
+      if (body.startsWith('#IMPLIED', j)) {
+        j += '#IMPLIED'.length
+        continue
+      }
+      if (body.startsWith('#FIXED', j)) {
+        j += '#FIXED'.length
+        j = skipSpace(j)
+      }
+      if (body[j] === '"' || body[j] === "'") {
+        const quote = body[j]
+        j++
+        const valStart = j
+        while (j < body.length && body[j] !== quote) j++
+        if (j >= body.length) break
+        const value = body.substring(valStart, j)
+        if (!out[elemName.name]) out[elemName.name] = {}
+        out[elemName.name][attrName.name] = value
+        j++
+      }
+    }
+    i = j
+  }
+  return out
+}
+
+// applyAttrDefaults merges in DOCTYPE-supplied default attribute
+// values (`<!ATTLIST element attr ... "default">`) for any attribute
+// missing from the parsed element instance. Returns the original
+// attributes object if no defaults apply.
+function applyAttrDefaults(
+  attrs: Record<string, string>,
+  elemName: string,
+  ctx: Context,
+): Record<string, string> {
+  const defaults = ctx?.u?.dtdAttrDefaults?.[elemName]
+  if (!defaults) return attrs
+  const out = { ...attrs }
+  for (const k of Object.keys(defaults)) {
+    if (!Object.prototype.hasOwnProperty.call(out, k)) {
+      out[k] = defaults[k]
+    }
+  }
+  return out
+}
+
+// readNameInBody is a free-function counterpart to the matcher's
+// `readName` closure used by the DTD parsers, which run before the
+// matcher closure has been instantiated.
+function readNameInBody(s: string, start: number): { name: string; end: number } | null {
+  if (start >= s.length) return null
+  const cp0 = s.codePointAt(start)!
+  if (!isNameStartCP(cp0)) return null
+  let i = start + (cp0 > 0xffff ? 2 : 1)
+  while (i < s.length) {
+    const cp = s.codePointAt(i)!
+    if (!isNameCharCP(cp)) break
+    i += cp > 0xffff ? 2 : 1
+  }
+  return { name: s.substring(start, i), end: i }
+}
+
+// Parse the body of a DOCTYPE declaration (the text between the `[`
 // and `]` of the internal subset) and extract every internal general
 // entity declaration `<!ENTITY name "value">`. Parameter entity
 // declarations (`<!ENTITY % name ...>`) and external entity
@@ -772,15 +899,23 @@ function buildXmlTagMatcher(
           return lex.bad('unterminated_doctype', sI, src.length)
         }
         const end = i + 1
-        // Extract any <!ENTITY ...> general internal entity
-        // declarations from the internal subset and stash them on
-        // the per-parse context. The matcher's text and attribute
-        // paths read this map back via lex.ctx.u.dtdEntities.
+        // Extract internal-subset declarations and stash them on
+        // the per-parse context. The matcher's text/attribute paths
+        // and the element actions read these back via lex.ctx.u.
         if (subsetStart >= 0 && subsetEnd > subsetStart && lex.ctx) {
           const u: any = lex.ctx.u || (lex.ctx.u = {})
-          const found = parseDoctypeEntities(src.substring(subsetStart, subsetEnd))
-          if (Object.keys(found).length > 0) {
-            u.dtdEntities = { ...(u.dtdEntities || {}), ...found }
+          const subset = src.substring(subsetStart, subsetEnd)
+          const ents = parseDoctypeEntities(subset)
+          if (Object.keys(ents).length > 0) {
+            u.dtdEntities = { ...(u.dtdEntities || {}), ...ents }
+          }
+          const atts = parseDoctypeAttlists(subset)
+          if (Object.keys(atts).length > 0) {
+            const merged = { ...(u.dtdAttrDefaults || {}) }
+            for (const elem of Object.keys(atts)) {
+              merged[elem] = { ...(merged[elem] || {}), ...atts[elem] }
+            }
+            u.dtdAttrDefaults = merged
           }
         }
         const tkn = lex.token('#XIG', src.substring(sI, end), src.substring(sI, end), pnt)

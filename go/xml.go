@@ -222,7 +222,7 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 			r.Node = map[string]any{
 				"name":       name,
 				"localName":  name,
-				"attributes": attrs,
+				"attributes": applyAttrDefaults(attrs, name, ctx),
 				"children":   []any{},
 			}
 		}),
@@ -234,7 +234,7 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 			r.Node = map[string]any{
 				"name":       name,
 				"localName":  name,
-				"attributes": attrs,
+				"attributes": applyAttrDefaults(attrs, name, ctx),
 				"children":   []any{},
 			}
 		}),
@@ -383,6 +383,148 @@ func dtdEntities(lex *jsonic.Lex) map[string]string {
 	}
 	m, _ := lex.Ctx.U["dtdEntities"].(map[string]string)
 	return m
+}
+
+// dtdAttrDefaults reads the per-parse DOCTYPE-supplied attribute
+// default map keyed by element name (set by the DOCTYPE matcher
+// path). Returns nil if none have been registered yet.
+func dtdAttrDefaults(ctx *jsonic.Context) map[string]map[string]string {
+	if ctx == nil || ctx.U == nil {
+		return nil
+	}
+	m, _ := ctx.U["dtdAttrDefaults"].(map[string]map[string]string)
+	return m
+}
+
+// applyAttrDefaults merges in DOCTYPE-supplied default attribute
+// values for any attribute missing from the parsed element instance.
+// Returns the original map if no defaults apply.
+func applyAttrDefaults(
+	attrs map[string]any, elemName string, ctx *jsonic.Context,
+) map[string]any {
+	all := dtdAttrDefaults(ctx)
+	if all == nil {
+		return attrs
+	}
+	defaults, ok := all[elemName]
+	if !ok {
+		return attrs
+	}
+	for k, v := range defaults {
+		if _, present := attrs[k]; !present {
+			attrs[k] = v
+		}
+	}
+	return attrs
+}
+
+// parseDoctypeAttlists scans a DOCTYPE internal-subset body and
+// extracts every `<!ATTLIST element attr type defaultDecl>` default
+// attribute value, keyed by element name and attribute name. Both
+// literal defaults and `#FIXED "value"` defaults are returned;
+// `#REQUIRED` and `#IMPLIED` declarations contribute nothing because
+// they have no default value.
+func parseDoctypeAttlists(body string) map[string]map[string]string {
+	skipSpace := func(s int) int {
+		for s < len(body) && isSpace(body[s]) {
+			s++
+		}
+		return s
+	}
+	out := map[string]map[string]string{}
+
+	i := 0
+	for i < len(body) {
+		idx := strings.Index(body[i:], "<!ATTLIST")
+		if idx < 0 {
+			break
+		}
+		j := i + idx + len("<!ATTLIST")
+		j = skipSpace(j)
+		elemName, after, ok := readName(body, j)
+		if !ok {
+			i = j + 1
+			continue
+		}
+		j = after
+
+		for j < len(body) {
+			j = skipSpace(j)
+			if j >= len(body) {
+				break
+			}
+			if body[j] == '>' {
+				j++
+				break
+			}
+			attrName, attrEnd, ok := readName(body, j)
+			if !ok {
+				j++
+				continue
+			}
+			j = attrEnd
+			j = skipSpace(j)
+
+			// Skip AttType.
+			if j < len(body) && body[j] == '(' {
+				close := strings.Index(body[j:], ")")
+				if close < 0 {
+					j = len(body)
+					break
+				}
+				j = j + close + 1
+			} else if strings.HasPrefix(body[j:], "NOTATION") {
+				j += len("NOTATION")
+				j = skipSpace(j)
+				if j < len(body) && body[j] == '(' {
+					close := strings.Index(body[j:], ")")
+					if close < 0 {
+						j = len(body)
+						break
+					}
+					j = j + close + 1
+				}
+			} else {
+				for j < len(body) && body[j] >= 'A' && body[j] <= 'Z' {
+					j++
+				}
+			}
+			j = skipSpace(j)
+
+			// DefaultDecl.
+			if strings.HasPrefix(body[j:], "#REQUIRED") {
+				j += len("#REQUIRED")
+				continue
+			}
+			if strings.HasPrefix(body[j:], "#IMPLIED") {
+				j += len("#IMPLIED")
+				continue
+			}
+			if strings.HasPrefix(body[j:], "#FIXED") {
+				j += len("#FIXED")
+				j = skipSpace(j)
+			}
+			if j < len(body) && (body[j] == '"' || body[j] == '\'') {
+				quote := body[j]
+				j++
+				valStart := j
+				for j < len(body) && body[j] != quote {
+					j++
+				}
+				if j >= len(body) {
+					break
+				}
+				value := body[valStart:j]
+				if out[elemName] == nil {
+					out[elemName] = map[string]string{}
+				}
+				out[elemName][attrName] = value
+				j++
+			}
+		}
+		i = j
+	}
+	return out
 }
 
 // parseDoctypeEntities scans a DOCTYPE internal-subset body and
@@ -774,16 +916,16 @@ func buildXmlTagMatcher(
 					return lex.Bad("unterminated_doctype")
 				}
 				finish := i + 1
-				// Extract any <!ENTITY ...> general internal entity
-				// declarations from the internal subset and stash them
-				// on the per-parse context. The matcher's text and
-				// attribute paths read this map back via lex.Ctx.U.
+				// Extract internal-subset declarations and stash them
+				// on the per-parse context. The matcher's text /
+				// attribute paths and the element actions read these
+				// back via lex.Ctx.U.
 				if subsetStart >= 0 && subsetEnd > subsetStart && lex.Ctx != nil {
-					found := parseDoctypeEntities(src[subsetStart:subsetEnd])
-					if len(found) > 0 {
-						if lex.Ctx.U == nil {
-							lex.Ctx.U = map[string]any{}
-						}
+					subset := src[subsetStart:subsetEnd]
+					if lex.Ctx.U == nil {
+						lex.Ctx.U = map[string]any{}
+					}
+					if found := parseDoctypeEntities(subset); len(found) > 0 {
 						existing, _ := lex.Ctx.U["dtdEntities"].(map[string]string)
 						if existing == nil {
 							existing = map[string]string{}
@@ -792,6 +934,21 @@ func buildXmlTagMatcher(
 							existing[k] = v
 						}
 						lex.Ctx.U["dtdEntities"] = existing
+					}
+					if found := parseDoctypeAttlists(subset); len(found) > 0 {
+						existing, _ := lex.Ctx.U["dtdAttrDefaults"].(map[string]map[string]string)
+						if existing == nil {
+							existing = map[string]map[string]string{}
+						}
+						for elem, defs := range found {
+							if existing[elem] == nil {
+								existing[elem] = map[string]string{}
+							}
+							for k, v := range defs {
+								existing[elem][k] = v
+							}
+						}
+						lex.Ctx.U["dtdAttrDefaults"] = existing
 					}
 				}
 				tsrc := src[sI:finish]
