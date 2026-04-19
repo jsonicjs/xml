@@ -365,6 +365,81 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 	return nil
 }
 
+// dtdEntities reads the per-parse DOCTYPE-declared entity map (set
+// by the DOCTYPE matcher path). Returns nil if none have been
+// registered yet.
+func dtdEntities(lex *jsonic.Lex) map[string]string {
+	if lex == nil || lex.Ctx == nil || lex.Ctx.U == nil {
+		return nil
+	}
+	m, _ := lex.Ctx.U["dtdEntities"].(map[string]string)
+	return m
+}
+
+// parseDoctypeEntities scans a DOCTYPE internal-subset body and
+// extracts every internal general entity declaration of the form
+// `<!ENTITY name "value">` (or single-quoted). Parameter entity
+// declarations (`<!ENTITY % name ...>`) and external entity
+// declarations (`<!ENTITY name SYSTEM "...">` etc.) are skipped, as
+// are `<!ELEMENT`, `<!ATTLIST`, and `<!NOTATION` declarations.
+//
+// Returned values are stored verbatim — character and entity
+// references inside an entity value are expanded only when the
+// outer entity is referenced.
+func parseDoctypeEntities(body string) map[string]string {
+	out := map[string]string{}
+	i := 0
+	for i < len(body) {
+		idx := strings.Index(body[i:], "<!ENTITY")
+		if idx < 0 {
+			break
+		}
+		j := i + idx + len("<!ENTITY")
+		for j < len(body) && isSpace(body[j]) {
+			j++
+		}
+		// Parameter entity: skip.
+		if j < len(body) && body[j] == '%' {
+			end := strings.Index(body[j:], ">")
+			if end < 0 {
+				break
+			}
+			i = j + end + 1
+			continue
+		}
+		// Read the entity name.
+		name, after, ok := readName(body, j)
+		if !ok {
+			i = j + 1
+			continue
+		}
+		j = after
+		for j < len(body) && isSpace(body[j]) {
+			j++
+		}
+		// Quoted value -> internal entity. SYSTEM/PUBLIC -> skip.
+		if j < len(body) && (body[j] == '"' || body[j] == '\'') {
+			quote := body[j]
+			j++
+			valStart := j
+			for j < len(body) && body[j] != quote {
+				j++
+			}
+			if j >= len(body) {
+				break
+			}
+			out[name] = body[valStart:j]
+			j++
+		}
+		end := strings.Index(body[j:], ">")
+		if end < 0 {
+			break
+		}
+		i = j + end + 1
+	}
+	return out
+}
+
 // xmlDepth reads the per-parse XML nesting counter from the lex context.
 // Returns 0 if not set.
 func xmlDepth(lex *jsonic.Lex) int {
@@ -469,22 +544,29 @@ var predefinedEntities = map[string]string{
 // supports named groups; this uses plain groups for portability.
 var entityRE = regexp.MustCompile(`&(#x[0-9a-fA-F]+|#[0-9]+|[A-Za-z_][A-Za-z0-9_]*);`)
 
+// EntityDecoder decodes XML entity references in `s`. The optional
+// `dtd` map supplies general entity declarations parsed from the
+// DOCTYPE internal subset; values are recursively expanded with
+// cycle detection.
+type EntityDecoder func(s string, dtd map[string]string) string
+
 // buildEntityDecoder returns a function that decodes the five
-// predefined entities, numeric character references, and any
-// caller-supplied custom entities. When `enabled` is false the
-// function is an identity.
-func buildEntityDecoder(enabled bool, custom map[string]string) func(string) string {
+// predefined entities, numeric character references, any
+// caller-supplied custom entities, and per-parse DTD entities.
+// When `enabled` is false the function is an identity.
+func buildEntityDecoder(enabled bool, custom map[string]string) EntityDecoder {
 	if !enabled {
-		return func(s string) string { return s }
+		return func(s string, _ map[string]string) string { return s }
 	}
-	merged := make(map[string]string, len(predefinedEntities)+len(custom))
+	base := make(map[string]string, len(predefinedEntities)+len(custom))
 	for k, v := range predefinedEntities {
-		merged[k] = v
+		base[k] = v
 	}
 	for k, v := range custom {
-		merged[k] = v
+		base[k] = v
 	}
-	return func(s string) string {
+	var expand func(s string, dtd map[string]string, seen map[string]bool) string
+	expand = func(s string, dtd map[string]string, seen map[string]bool) string {
 		if !strings.Contains(s, "&") {
 			return s
 		}
@@ -503,11 +585,26 @@ func buildEntityDecoder(enabled bool, custom map[string]string) func(string) str
 				}
 				return string(rune(code))
 			}
-			if v, ok := merged[ref]; ok {
+			if v, ok := base[ref]; ok {
 				return v
+			}
+			if dtd != nil {
+				if v, ok := dtd[ref]; ok {
+					if seen[ref] {
+						// Recursive reference; break the cycle.
+						return match
+					}
+					seen[ref] = true
+					out := expand(v, dtd, seen)
+					delete(seen, ref)
+					return out
+				}
 			}
 			return match
 		})
+	}
+	return func(s string, dtd map[string]string) string {
+		return expand(s, dtd, map[string]bool{})
 	}
 }
 
@@ -522,7 +619,7 @@ func buildEntityDecoder(enabled bool, custom map[string]string) func(string) str
 //	#XIG  <!-- ... -->  |  <?...?>  |  <!DOCTYPE ...>  (ignored)
 //	#TX   <![CDATA[ ... ]]>        val = cdata body (verbatim, no entity decoding)
 func buildXmlTagMatcher(
-	decode func(string) string,
+	decode EntityDecoder,
 	entitiesOn bool,
 	embed bool,
 	xigTin, xopTin, xclTin, xscTin jsonic.Tin,
@@ -569,7 +666,7 @@ func buildXmlTagMatcher(
 					normalised := normaliseLineEndings(raw)
 					var val any = normalised
 					if entitiesOn {
-						val = decode(normalised)
+						val = decode(normalised, dtdEntities(lex))
 					}
 					tkn := lex.Token("#TX", jsonic.TinTX, val, raw)
 					advance(pnt, sI, i)
@@ -627,12 +724,19 @@ func buildXmlTagMatcher(
 			if strings.HasPrefix(src[sI:], "<!DOCTYPE") {
 				i := sI + 9
 				depth := 0
+				subsetStart, subsetEnd := -1, -1
 				for i < srclen {
 					ch := src[i]
 					if ch == '[' {
+						if depth == 0 {
+							subsetStart = i + 1
+						}
 						depth++
 					} else if ch == ']' {
 						depth--
+						if depth == 0 {
+							subsetEnd = i
+						}
 					} else if ch == '>' && depth <= 0 {
 						break
 					}
@@ -642,6 +746,26 @@ func buildXmlTagMatcher(
 					return lex.Bad("unterminated_doctype")
 				}
 				finish := i + 1
+				// Extract any <!ENTITY ...> general internal entity
+				// declarations from the internal subset and stash them
+				// on the per-parse context. The matcher's text and
+				// attribute paths read this map back via lex.Ctx.U.
+				if subsetStart >= 0 && subsetEnd > subsetStart && lex.Ctx != nil {
+					found := parseDoctypeEntities(src[subsetStart:subsetEnd])
+					if len(found) > 0 {
+						if lex.Ctx.U == nil {
+							lex.Ctx.U = map[string]any{}
+						}
+						existing, _ := lex.Ctx.U["dtdEntities"].(map[string]string)
+						if existing == nil {
+							existing = map[string]string{}
+						}
+						for k, v := range found {
+							existing[k] = v
+						}
+						lex.Ctx.U["dtdEntities"] = existing
+					}
+				}
 				tsrc := src[sI:finish]
 				tkn := lex.Token("#XIG", xigTin, tsrc, tsrc)
 				advance(pnt, sI, finish)
@@ -793,7 +917,7 @@ func buildXmlTagMatcher(
 				// types, all attributes are treated as CDATA-typed
 				// (no further whitespace collapsing or trimming).
 				normalised := normaliseAttrWhitespace(raw)
-				attrs[attrName] = decode(normalised)
+				attrs[attrName] = decode(normalised, dtdEntities(lex))
 			}
 		}
 	}

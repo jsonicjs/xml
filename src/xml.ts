@@ -446,14 +446,27 @@ const predefinedEntities: Record<string, string> = {
   apos: "'",
 }
 
+// Build an entity decoder. The plugin-time entity map (predefined +
+// customEntities) is closed over; per-parse entities declared in the
+// DOCTYPE internal subset are passed in via the optional `dtd`
+// argument and recursively expanded with cycle detection.
+//
+// Returned function signature:
+//   decode(src, dtd?) -> string
+// where `dtd` is a per-parse map { name -> raw value } that the
+// matcher pulls from `lex.ctx.u.dtdEntities`.
 function buildEntityDecoder(options: XmlOptions) {
-  const entities = {
+  const baseEntities = {
     ...predefinedEntities,
     ...(options?.customEntities || {}),
   }
-  const entityRE = /&(#x[0-9a-fA-F]+|#[0-9]+|[A-Za-z_][A-Za-z0-9_]*);/g
+  const entityRE = /&(#x[0-9a-fA-F]+|#[0-9]+|[A-Za-z_:][A-Za-z0-9_\-\.:]*);/g
 
-  return function decodeEntities(src: string): string {
+  function expand(
+    src: string,
+    dtd: Record<string, string>,
+    seen: Set<string>,
+  ): string {
     if (src.indexOf('&') < 0) return src
     return src.replace(entityRE, (match, ref) => {
       if (ref[0] === '#') {
@@ -468,9 +481,86 @@ function buildEntityDecoder(options: XmlOptions) {
           return match
         }
       }
-      return undefined !== entities[ref] ? entities[ref] : match
+      // Predefined / option-supplied entities take precedence over
+      // anything declared in the DTD (matches the XML 1.0 rule that
+      // the five predefined entities are always available).
+      if (undefined !== baseEntities[ref]) return baseEntities[ref]
+      if (undefined !== dtd[ref]) {
+        if (seen.has(ref)) {
+          // Recursive entity reference is a WF violation. Fall through
+          // and keep the unexpanded text so the upstream WF check can
+          // catch the resulting bare `&` if the caller wants to treat
+          // this as an error; here we simply break the cycle.
+          return match
+        }
+        seen.add(ref)
+        const out = expand(dtd[ref], dtd, seen)
+        seen.delete(ref)
+        return out
+      }
+      return match
     })
   }
+
+  return function decodeEntities(src: string, dtd?: Record<string, string>): string {
+    return expand(src, dtd || {}, new Set())
+  }
+}
+
+// Parse the body of a DOCTYPE declaration (the text between the `[`
+// and `]` of the internal subset) and extract every internal general
+// entity declaration `<!ENTITY name "value">`. Parameter entity
+// declarations (`<!ENTITY % name ...>`) and external entity
+// declarations (`<!ENTITY name SYSTEM "...">` etc.) are recognised
+// but skipped. Other declarations (`<!ELEMENT`, `<!ATTLIST`,
+// `<!NOTATION`) are also skipped.
+//
+// Returned values are stored verbatim — character and entity
+// references inside an entity value are expanded only when the
+// outer entity is referenced.
+function parseDoctypeEntities(body: string): Record<string, string> {
+  const ents: Record<string, string> = {}
+  const isSpace = (ch: string) =>
+    ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r'
+  const isNm = (ch: string) => isNameCharCP(ch.charCodeAt(0))
+
+  let i = 0
+  while (i < body.length) {
+    const idx = body.indexOf('<!ENTITY', i)
+    if (idx < 0) break
+    let j = idx + '<!ENTITY'.length
+    while (j < body.length && isSpace(body[j])) j++
+    // Parameter entity: skip.
+    if (body[j] === '%') {
+      const end = body.indexOf('>', j)
+      i = end < 0 ? body.length : end + 1
+      continue
+    }
+    // Read name.
+    if (j >= body.length || !isNameStartCP(body.charCodeAt(j))) {
+      i = j + 1
+      continue
+    }
+    const nameStart = j
+    j++
+    while (j < body.length && isNm(body[j])) j++
+    const name = body.substring(nameStart, j)
+    while (j < body.length && isSpace(body[j])) j++
+    // Quoted entity value -> internal entity.
+    if (body[j] === '"' || body[j] === "'") {
+      const quote = body[j]
+      j++
+      const valStart = j
+      while (j < body.length && body[j] !== quote) j++
+      if (j >= body.length) break
+      ents[name] = body.substring(valStart, j)
+      j++
+    }
+    // External entity (SYSTEM / PUBLIC) - skip; we don't fetch.
+    const end = body.indexOf('>', j)
+    i = end < 0 ? body.length : end + 1
+  }
+  return ents
 }
 
 
@@ -489,7 +579,7 @@ function buildEntityDecoder(options: XmlOptions) {
 //   <!DOCTYPE ...>          -> #XIG  (parser ignores)
 //   <![CDATA[ ... ]]>       -> #TX   (verbatim text, no entity decoding)
 function buildXmlTagMatcher(
-  decodeEntity: (src: string) => string,
+  decodeEntity: (src: string, dtd?: Record<string, string>) => string,
   embed: boolean,
   options: XmlOptions,
 ) {
@@ -530,18 +620,21 @@ function buildXmlTagMatcher(
   // Returns either { val: string } on success or { err: string } if a
   // WF constraint is violated. Pure decoding (without validation) is
   // also available for CDATA bodies via decodeEntity().
-  function processText(raw: string): { val?: string; err?: string } {
+  function processText(
+    raw: string,
+    dtd: Record<string, string>,
+  ): { val?: string; err?: string } {
     const ctrlErr = checkChars(raw)
     if (ctrlErr) return { err: ctrlErr }
     if (raw.indexOf(']]>') >= 0) {
       return { err: 'cdata_terminator_in_text' }
     }
-    const ampErr = checkEntityRefs(raw)
+    const ampErr = checkEntityRefs(raw, dtd)
     if (ampErr) return { err: ampErr }
     // §2.11: normalise CR LF and lone CR to LF before downstream processing.
     const normalised = normaliseLineEndings(raw)
     return {
-      val: options.entities !== false ? decodeEntity(normalised) : normalised,
+      val: options.entities !== false ? decodeEntity(normalised, dtd) : normalised,
     }
   }
 
@@ -580,7 +673,8 @@ function buildXmlTagMatcher(
           while (i < src.length && src[i] !== '<') i++
           if (i === sI) return undefined
           const raw = src.substring(sI, i)
-          const result = processText(raw)
+          const dtd = (lex.ctx?.u?.dtdEntities) || {}
+          const result = processText(raw, dtd)
           if (result.err) {
             return lex.bad(result.err, sI, i)
           }
@@ -636,17 +730,34 @@ function buildXmlTagMatcher(
       if (src.startsWith('<!DOCTYPE', sI)) {
         let i = sI + 9
         let depth = 0
+        let subsetStart = -1
+        let subsetEnd = -1
         while (i < src.length) {
           const ch = src[i]
-          if (ch === '[') depth++
-          else if (ch === ']') depth--
-          else if (ch === '>' && depth <= 0) break
+          if (ch === '[') {
+            if (depth === 0) subsetStart = i + 1
+            depth++
+          } else if (ch === ']') {
+            depth--
+            if (depth === 0) subsetEnd = i
+          } else if (ch === '>' && depth <= 0) break
           i++
         }
         if (i >= src.length) {
           return lex.bad('unterminated_doctype', sI, src.length)
         }
         const end = i + 1
+        // Extract any <!ENTITY ...> general internal entity
+        // declarations from the internal subset and stash them on
+        // the per-parse context. The matcher's text and attribute
+        // paths read this map back via lex.ctx.u.dtdEntities.
+        if (subsetStart >= 0 && subsetEnd > subsetStart && lex.ctx) {
+          const u: any = lex.ctx.u || (lex.ctx.u = {})
+          const found = parseDoctypeEntities(src.substring(subsetStart, subsetEnd))
+          if (Object.keys(found).length > 0) {
+            u.dtdEntities = { ...(u.dtdEntities || {}), ...found }
+          }
+        }
         const tkn = lex.token('#XIG', src.substring(sI, end), src.substring(sI, end), pnt)
         pnt.sI = end
         pnt.cI += end - sI
@@ -780,7 +891,8 @@ function buildXmlTagMatcher(
         if (charErr) {
           return lex.bad(charErr, valStart, i)
         }
-        const ampErr = checkEntityRefs(rawVal)
+        const dtd = (lex.ctx?.u?.dtdEntities) || {}
+        const ampErr = checkEntityRefs(rawVal, dtd)
         if (ampErr) {
           return lex.bad(ampErr, valStart, i)
         }
@@ -793,7 +905,7 @@ function buildXmlTagMatcher(
         // attribute types, so all attributes are treated as CDATA-
         // typed (no further whitespace collapsing or trimming).
         const normalised = normaliseAttrWhitespace(rawVal)
-        attributes[attrName] = decodeEntity(normalised)
+        attributes[attrName] = decodeEntity(normalised, dtd)
       }
     }
   }
@@ -868,13 +980,15 @@ function checkChars(s: string): string {
 
 // Validate entity references in a run of character data. Returns an
 // error code on the first malformed reference, or '' if every `&`
-// in the input is part of a well-formed reference.
+// in the input is part of a well-formed reference. The optional
+// `dtd` argument lets the validator accept DOCTYPE-declared entity
+// names; without it, only the syntactic form is enforced.
 //
 // Well-formed forms:
 //   &name;       — name must start with a NameStartChar
 //   &#nnnn;      — decimal numeric character reference
 //   &#xhhhh;     — hexadecimal numeric character reference
-function checkEntityRefs(s: string): string {
+function checkEntityRefs(s: string, _dtd?: Record<string, string>): string {
   for (let i = 0; i < s.length; i++) {
     if (s[i] !== '&') continue
     const semi = s.indexOf(';', i + 1)
