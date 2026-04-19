@@ -70,7 +70,7 @@ const grammarText = `
   rule: xml: open: [
     { s: '#ZZ' }
     { s: '#TX' r: xml }
-    { p: element }
+    { p: element c: '@no-root-yet' }
   ]
   rule: xml: close: [
     { s: '#ZZ' }
@@ -203,11 +203,19 @@ Expected </$openname> but found </$fsrc>.`,
       if (r.child && r.child.node) {
         const root = ctx.root()
         root.node = r.child.node
+        // Mark the document as having seen its root so the
+        // `@no-root-yet` condition gates any further attempts to
+        // push a second root element.
+        ctx.u.rootSeen = true
         if (options.namespaces !== false) {
           resolveNamespaces(root.node, {})
         }
       }
     },
+
+    // Condition: only allow the xml rule to push an `element` if the
+    // document hasn't already produced a root (XML 1.0 §2.1).
+    '@no-root-yet': (_r: Rule, ctx: Context) => true !== ctx.u.rootSeen,
 
     '@element-open': (r: Rule) => {
       const v = r.o0.val

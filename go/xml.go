@@ -178,11 +178,20 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 			r.Node = r.Child.Node
 			root := firstRule(r)
 			root.Node = r.Child.Node
+			// Mark the document as having seen its root so the
+			// @no-root-yet condition rejects any subsequent attempt
+			// to push a second root element (XML 1.0 §2.1).
+			ctx.U["rootSeen"] = true
 			if namespacesOn {
 				if el, ok := r.Node.(map[string]any); ok {
 					resolveNamespaces(el, nil)
 				}
 			}
+		}),
+
+		"@no-root-yet": jsonic.AltCond(func(_ *jsonic.Rule, ctx *jsonic.Context) bool {
+			seen, _ := ctx.U["rootSeen"].(bool)
+			return !seen
 		}),
 
 		"@element-open": jsonic.AltAction(func(r *jsonic.Rule, ctx *jsonic.Context) {
@@ -265,7 +274,7 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 				Open: []*jsonic.GrammarAltSpec{
 					{S: "#ZZ"},
 					{S: "#TX", R: "xml"},
-					{P: "element"},
+					{P: "element", C: "@no-root-yet"},
 				},
 				Close: []*jsonic.GrammarAltSpec{
 					{S: "#ZZ"},

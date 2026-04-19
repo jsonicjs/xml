@@ -14,7 +14,7 @@
   rule: xml: open: [
     { s: '#ZZ' }
     { s: '#TX' r: xml }
-    { p: element }
+    { p: element c: '@no-root-yet' }
   ]
   rule: xml: close: [
     { s: '#ZZ' }
