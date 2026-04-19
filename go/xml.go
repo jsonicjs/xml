@@ -111,6 +111,7 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 			"lt_in_attr_value":         "\"<\" is not allowed in an attribute value",
 			"bad_entity_ref":           "malformed entity reference (need &name; or &#NNN; or &#xHHH;)",
 			"duplicate_attribute":      "duplicate attribute name in tag",
+			"invalid_xml_char":         "illegal control character in XML data",
 		},
 		Hint: map[string]string{
 			"xml_mismatched_tag":       "Each opening tag must be paired with a matching closing tag.\nExpected </$openname> but found </$fsrc>.",
@@ -122,6 +123,7 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 			"lt_in_attr_value":         "Use the entity reference &lt; to include \"<\" in an attribute value.",
 			"bad_entity_ref":           "Replace literal \"&\" with &amp;, or terminate the entity reference with \";\".",
 			"duplicate_attribute":      "Each attribute name in an open tag must be unique.",
+			"invalid_xml_char":         "Only #x9, #xA, #xD and code points >= #x20 are legal XML characters.",
 		},
 	})
 
@@ -475,6 +477,9 @@ func buildXmlTagMatcher(
 						return nil
 					}
 					raw := src[sI:i]
+					if code := checkChars(raw); code != "" {
+						return lex.Bad(code)
+					}
 					if strings.Contains(raw, "]]>") {
 						return lex.Bad("cdata_terminator_in_text")
 					}
@@ -503,9 +508,13 @@ func buildXmlTagMatcher(
 				}
 				bodyStart := sI + 4
 				bodyEnd := bodyStart + end
+				body := src[bodyStart:bodyEnd]
 				// WF: "--" must not occur in a comment body.
-				if strings.Contains(src[bodyStart:bodyEnd], "--") {
+				if strings.Contains(body, "--") {
 					return lex.Bad("comment_double_dash")
+				}
+				if code := checkChars(body); code != "" {
+					return lex.Bad(code)
 				}
 				finish := bodyEnd + 3
 				tsrc := src[sI:finish]
@@ -523,6 +532,9 @@ func buildXmlTagMatcher(
 				}
 				finish := body + end + 3
 				text := src[body : body+end]
+				if code := checkChars(text); code != "" {
+					return lex.Bad(code)
+				}
 				tsrc := src[sI:finish]
 				tkn := lex.Token("#TX", jsonic.TinTX, text, tsrc)
 				advance(pnt, sI, finish)
@@ -572,6 +584,9 @@ func buildXmlTagMatcher(
 				}
 				if i < bodyEnd && !isSpace(src[i]) {
 					return lex.Bad("pi_target_invalid")
+				}
+				if code := checkChars(src[sI+2 : bodyEnd]); code != "" {
+					return lex.Bad(code)
 				}
 				finish := bodyEnd + 2
 				tsrc := src[sI:finish]
@@ -700,6 +715,9 @@ func buildXmlTagMatcher(
 				raw := src[valStart:i]
 				i++ // consume closing quote
 
+				if code := checkChars(raw); code != "" {
+					return lex.Bad(code)
+				}
 				if code := checkEntityRefs(raw); code != "" {
 					return lex.Bad(code)
 				}
@@ -710,6 +728,21 @@ func buildXmlTagMatcher(
 			}
 		}
 	}
+}
+
+// checkChars validates that every byte in `s` is a legal XML 1.0 Char.
+// Returns "invalid_xml_char" on the first illegal byte, "" if all
+// bytes are legal. Only the C0 control band is checked here; the full
+// Char production (which excludes #xFFFE/#xFFFF and unpaired
+// surrogates) is not enforced.
+func checkChars(s string) string {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 && c != 0x09 && c != 0x0a && c != 0x0d {
+			return "invalid_xml_char"
+		}
+	}
+	return ""
 }
 
 // checkEntityRefs validates that every `&` in `s` begins a well-formed

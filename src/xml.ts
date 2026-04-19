@@ -181,6 +181,7 @@ const Xml: Plugin = (jsonic: Jsonic, options: XmlOptions) => {
       lt_in_attr_value: '"<" is not allowed in an attribute value',
       bad_entity_ref: 'malformed entity reference (need &name; or &#NNN; or &#xHHH;)',
       duplicate_attribute: 'duplicate attribute name in tag',
+      invalid_xml_char: 'illegal control character in XML data',
     },
     hint: {
       xml_mismatched_tag: `Each opening tag must be paired with a matching closing tag.
@@ -193,6 +194,7 @@ Expected </$openname> but found </$fsrc>.`,
       lt_in_attr_value: `Use the entity reference &lt; to include "<" in an attribute value.`,
       bad_entity_ref: `Replace literal "&" with &amp;, or terminate the entity reference with ";".`,
       duplicate_attribute: `Each attribute name in an open tag must be unique.`,
+      invalid_xml_char: `Only #x9, #xA, #xD and code points >= #x20 are legal XML characters.`,
     },
   })
 
@@ -355,12 +357,16 @@ function buildXmlTagMatcher(
 
   // Validate and decode a run of character data (non-CDATA). Enforces
   // the XML 1.0 well-formedness constraints applicable to text:
+  //   - every code point must be a legal XML Char (no C0 controls
+  //     other than tab, newline, carriage return);
   //   - the literal sequence "]]>" must not appear in character data;
   //   - every "&" must start a well-formed entity reference.
   // Returns either { val: string } on success or { err: string } if a
   // WF constraint is violated. Pure decoding (without validation) is
   // also available for CDATA bodies via decodeEntity().
   function processText(raw: string): { val?: string; err?: string } {
+    const ctrlErr = checkChars(raw)
+    if (ctrlErr) return { err: ctrlErr }
     if (raw.indexOf(']]>') >= 0) {
       return { err: 'cdata_terminator_in_text' }
     }
@@ -407,10 +413,13 @@ function buildXmlTagMatcher(
         if (endIdx === -1) {
           return lex.bad('unterminated_comment', sI, src.length)
         }
-        // WF constraint: "--" must not occur in a comment body.
         const body = src.substring(sI + 4, endIdx)
+        // WF constraint: "--" must not occur in a comment body.
         if (body.indexOf('--') >= 0) {
           return lex.bad('comment_double_dash', sI, endIdx + 3)
+        }
+        if (checkChars(body)) {
+          return lex.bad('invalid_xml_char', sI, endIdx + 3)
         }
         const end = endIdx + 3
         const tkn = lex.token('#XIG', src.substring(sI, end), src.substring(sI, end), pnt)
@@ -427,6 +436,9 @@ function buildXmlTagMatcher(
         }
         const end = endIdx + 3
         const text = src.substring(sI + 9, endIdx)
+        if (checkChars(text)) {
+          return lex.bad('invalid_xml_char', sI, end)
+        }
         const tkn = lex.token('#TX', text, src.substring(sI, end), pnt)
         pnt.sI = end
         pnt.cI += end - sI
@@ -470,6 +482,9 @@ function buildXmlTagMatcher(
         // After the target, only whitespace then content is allowed.
         if (i < endIdx && !isSpace(src[i])) {
           return lex.bad('pi_target_invalid', sI, endIdx + 2)
+        }
+        if (checkChars(src.substring(sI + 2, endIdx))) {
+          return lex.bad('invalid_xml_char', sI, endIdx + 2)
         }
         const end = endIdx + 2
         const tkn = lex.token('#XIG', src.substring(sI, end), src.substring(sI, end), pnt)
@@ -580,6 +595,10 @@ function buildXmlTagMatcher(
         const rawVal = src.substring(valStart, i)
         i++
 
+        const charErr = checkChars(rawVal)
+        if (charErr) {
+          return lex.bad(charErr, valStart, i)
+        }
         const ampErr = checkEntityRefs(rawVal)
         if (ampErr) {
           return lex.bad(ampErr, valStart, i)
@@ -593,6 +612,21 @@ function buildXmlTagMatcher(
   }
 }
 
+
+// Validate that every code unit in `s` is a legal XML 1.0 Char.
+// Returns 'invalid_xml_char' on the first illegal character, '' if all
+// characters are legal. Only the C0 control band is checked here; the
+// full Char production (which excludes #xFFFE/#xFFFF and unpaired
+// surrogates) is not enforced.
+function checkChars(s: string): string {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    if (c < 0x20 && c !== 0x09 && c !== 0x0a && c !== 0x0d) {
+      return 'invalid_xml_char'
+    }
+  }
+  return ''
+}
 
 // Validate entity references in a run of character data. Returns an
 // error code on the first malformed reference, or '' if every `&`
