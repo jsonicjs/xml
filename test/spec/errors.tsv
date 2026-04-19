@@ -8,3 +8,9 @@ unterminated-comment	<a><!-- unterminated	ERROR
 unterminated-cdata	<a><![CDATA[unterminated	ERROR
 unterminated-pi	<a><?target data	ERROR
 unterminated-tag	<a x="unterminated	ERROR
+xmlns-redeclare-xmlns	<a xmlns:xmlns="http://example.com"/>	ERROR:reserved_namespace
+xmlns-xml-wrong-uri	<a xmlns:xml="http://example.com"/>	ERROR:reserved_namespace
+xmlns-default-xml-uri	<a xmlns="http://www.w3.org/XML/1998/namespace"/>	ERROR:reserved_namespace
+xmlns-other-prefix-xml-uri	<a xmlns:foo="http://www.w3.org/XML/1998/namespace"/>	ERROR:reserved_namespace
+unbound-element-prefix	<a><foo:b/></a>	ERROR:unbound_prefix
+unbound-attribute-prefix	<a foo:bar="x"/>	ERROR:unbound_prefix

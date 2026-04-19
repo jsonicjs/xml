@@ -115,6 +115,8 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 			"bad_entity_ref":           "malformed entity reference (need &name; or &#NNN; or &#xHHH;)",
 			"duplicate_attribute":      "duplicate attribute name in tag",
 			"invalid_xml_char":         "illegal control character in XML data",
+			"reserved_namespace":       "invalid use of a reserved namespace prefix or URI",
+			"unbound_prefix":           "element or attribute uses an undeclared namespace prefix",
 		},
 		Hint: map[string]string{
 			"xml_mismatched_tag":       "Each opening tag must be paired with a matching closing tag.\nExpected </$openname> but found </$fsrc>.",
@@ -127,6 +129,8 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 			"bad_entity_ref":           "Replace literal \"&\" with &amp;, or terminate the entity reference with \";\".",
 			"duplicate_attribute":      "Each attribute name in an open tag must be unique.",
 			"invalid_xml_char":         "Only #x9, #xA, #xD and code points >= #x20 are legal XML characters.",
+			"reserved_namespace":       "The \"xml\" prefix is fixed to " + xmlNSURI + "; the \"xmlns\" prefix cannot be redeclared, and neither URI may be bound to any other prefix or as the default namespace.",
+			"unbound_prefix":           "Declare the prefix with xmlns:prefix=\"...\" on this element or one of its ancestors.",
 		},
 	})
 
@@ -187,7 +191,12 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 			ctx.U["rootSeen"] = true
 			if namespacesOn {
 				if el, ok := r.Node.(map[string]any); ok {
-					resolveNamespaces(el, nil)
+					if code := resolveNamespaces(el, nil); code != "" {
+						ctx.ParseErr = &jsonic.Token{
+							Name: "#BD", Tin: jsonic.TinBD,
+							Err: code, Why: code, Src: code,
+						}
+					}
 				}
 			}
 		}),
@@ -944,15 +953,29 @@ type xmlScope struct {
 	lang  string
 }
 
+// Reserved namespace URIs (Namespaces in XML 1.0 §2).
+const (
+	xmlNSURI   = "http://www.w3.org/XML/1998/namespace"
+	xmlnsNSURI = "http://www.w3.org/2000/xmlns/"
+)
+
 // resolveNamespaces annotates `element` (and its descendants) with
 // `prefix`, `localName`, `namespace`, `space` and `lang` fields
 // resolved from xmlns / xmlns:* / xml:space / xml:lang attributes
-// in scope.
-func resolveNamespaces(element map[string]any, scope map[string]string) {
-	resolveScope(element, xmlScope{ns: scope, space: "default", lang: ""})
+// in scope. Returns "" on success or an error code on the first
+// reserved-prefix or unbound-prefix violation.
+func resolveNamespaces(element map[string]any, scope map[string]string) string {
+	// Pre-bind the reserved xml prefix so xml:space / xml:lang
+	// qualify without an explicit declaration.
+	ns := make(map[string]string, len(scope)+1)
+	for k, v := range scope {
+		ns[k] = v
+	}
+	ns["xml"] = xmlNSURI
+	return resolveScope(element, xmlScope{ns: ns, space: "default", lang: ""})
 }
 
-func resolveScope(element map[string]any, scope xmlScope) {
+func resolveScope(element map[string]any, scope xmlScope) string {
 	local := xmlScope{
 		ns:    make(map[string]string, len(scope.ns)+4),
 		space: scope.space,
@@ -966,13 +989,38 @@ func resolveScope(element map[string]any, scope xmlScope) {
 			s, _ := v.(string)
 			switch {
 			case k == "xmlns":
+				if s == xmlNSURI || s == xmlnsNSURI {
+					return "reserved_namespace"
+				}
 				local.ns[""] = s
 			case strings.HasPrefix(k, "xmlns:"):
-				local.ns[k[6:]] = s
+				prefix := k[6:]
+				switch prefix {
+				case "xml":
+					if s != xmlNSURI {
+						return "reserved_namespace"
+					}
+				case "xmlns":
+					return "reserved_namespace"
+				default:
+					if s == xmlNSURI || s == xmlnsNSURI {
+						return "reserved_namespace"
+					}
+				}
+				local.ns[prefix] = s
 			case k == "xml:space":
 				local.space = s
 			case k == "xml:lang":
 				local.lang = s
+			default:
+				if colon := strings.Index(k, ":"); colon > 0 {
+					ap := k[:colon]
+					if ap != "xmlns" {
+						if _, ok := local.ns[ap]; !ok {
+							return "unbound_prefix"
+						}
+					}
+				}
 			}
 		}
 	}
@@ -984,6 +1032,8 @@ func resolveScope(element map[string]any, scope xmlScope) {
 		element["localName"] = name[idx+1:]
 		if uri, ok := local.ns[prefix]; ok {
 			element["namespace"] = uri
+		} else {
+			return "unbound_prefix"
 		}
 	} else {
 		element["localName"] = name
@@ -1002,9 +1052,12 @@ func resolveScope(element map[string]any, scope xmlScope) {
 	children, _ := element["children"].([]any)
 	for _, c := range children {
 		if ce, ok := c.(map[string]any); ok {
-			resolveScope(ce, local)
+			if err := resolveScope(ce, local); err != "" {
+				return err
+			}
 		}
 	}
+	return ""
 }
 
 // --- helpers ---

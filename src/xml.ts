@@ -189,6 +189,8 @@ const Xml: Plugin = (jsonic: Jsonic, options: XmlOptions) => {
       bad_entity_ref: 'malformed entity reference (need &name; or &#NNN; or &#xHHH;)',
       duplicate_attribute: 'duplicate attribute name in tag',
       invalid_xml_char: 'illegal control character in XML data',
+      reserved_namespace: 'invalid use of a reserved namespace prefix or URI',
+      unbound_prefix: 'element or attribute uses an undeclared namespace prefix',
     },
     hint: {
       xml_mismatched_tag: `Each opening tag must be paired with a matching closing tag.
@@ -202,6 +204,8 @@ Expected </$openname> but found </$fsrc>.`,
       bad_entity_ref: `Replace literal "&" with &amp;, or terminate the entity reference with ";".`,
       duplicate_attribute: `Each attribute name in an open tag must be unique.`,
       invalid_xml_char: `Only #x9, #xA, #xD and code points >= #x20 are legal XML characters.`,
+      reserved_namespace: `The "xml" prefix is fixed to ${XML_NS_URI}; the "xmlns" prefix cannot be redeclared, and neither URI may be bound to any other prefix or as the default namespace.`,
+      unbound_prefix: `Declare the prefix with xmlns:prefix="..." on this element or one of its ancestors.`,
     },
   })
 
@@ -215,7 +219,10 @@ Expected </$openname> but found </$fsrc>.`,
         // push a second root element.
         ctx.u.rootSeen = true
         if (options.namespaces !== false) {
-          resolveNamespaces(root.node, {})
+          const nsErr = resolveNamespaces(root.node, {})
+          if (nsErr) {
+            return ctx.t0.bad(nsErr)
+          }
         }
       }
     },
@@ -921,11 +928,28 @@ type XmlScope = {
   lang: string
 }
 
-function resolveNamespaces(element: XmlElement, scope: Record<string, string>) {
-  resolveScope(element, { ns: scope, space: 'default', lang: '' })
+// Per Namespaces in XML 1.0 §2 "Reserved prefixes and namespace names":
+// the xml prefix is bound to the URI below and may be used implicitly.
+const XML_NS_URI = 'http://www.w3.org/XML/1998/namespace'
+// The xmlns prefix is reserved and must never be declared.
+const XMLNS_NS_URI = 'http://www.w3.org/2000/xmlns/'
+
+function resolveNamespaces(
+  element: XmlElement, scope: Record<string, string>,
+): string {
+  // Pre-bind the xml prefix to its reserved URI so xml:lang / xml:space
+  // qualify correctly without an explicit declaration.
+  return resolveScope(element, {
+    ns: { ...scope, xml: XML_NS_URI },
+    space: 'default',
+    lang: '',
+  })
 }
 
-function resolveScope(element: XmlElement, scope: XmlScope) {
+// Returns '' on success or an XML namespace error code on the first
+// violation (reserved-prefix misuse, unbound prefix). On error the
+// tree may be partly annotated; callers should treat that as undefined.
+function resolveScope(element: XmlElement, scope: XmlScope): string {
   const ns = { ...scope.ns }
   let space = scope.space
   let lang = scope.lang
@@ -933,13 +957,35 @@ function resolveScope(element: XmlElement, scope: XmlScope) {
   for (const key of Object.keys(element.attributes || {})) {
     const val = element.attributes[key]
     if (key === 'xmlns') {
+      if (val === XML_NS_URI || val === XMLNS_NS_URI) {
+        return 'reserved_namespace'
+      }
       ns[''] = val
     } else if (key.startsWith('xmlns:')) {
-      ns[key.substring(6)] = val
+      const prefix = key.substring(6)
+      if (prefix === 'xml') {
+        if (val !== XML_NS_URI) return 'reserved_namespace'
+      } else if (prefix === 'xmlns') {
+        return 'reserved_namespace'
+      } else if (val === XML_NS_URI || val === XMLNS_NS_URI) {
+        return 'reserved_namespace'
+      }
+      ns[prefix] = val
     } else if (key === 'xml:space') {
       space = val
     } else if (key === 'xml:lang') {
       lang = val
+    } else {
+      // Attribute name namespace check.
+      const colon = key.indexOf(':')
+      if (colon > 0) {
+        const ap = key.substring(0, colon)
+        if (ap === 'xmlns') {
+          // already handled above
+        } else if (!Object.prototype.hasOwnProperty.call(ns, ap)) {
+          return 'unbound_prefix'
+        }
+      }
     }
   }
 
@@ -948,8 +994,10 @@ function resolveScope(element: XmlElement, scope: XmlScope) {
     const prefix = element.name.substring(0, colonIdx)
     element.prefix = prefix
     element.localName = element.name.substring(colonIdx + 1)
-    if (ns[prefix]) {
+    if (Object.prototype.hasOwnProperty.call(ns, prefix)) {
       element.namespace = ns[prefix]
+    } else {
+      return 'unbound_prefix'
     }
   } else {
     element.localName = element.name
@@ -964,9 +1012,11 @@ function resolveScope(element: XmlElement, scope: XmlScope) {
   const childScope: XmlScope = { ns, space, lang }
   for (const child of element.children) {
     if (child && 'object' === typeof child) {
-      resolveScope(child, childScope)
+      const err = resolveScope(child, childScope)
+      if (err) return err
     }
   }
+  return ''
 }
 
 
