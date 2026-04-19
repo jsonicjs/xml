@@ -102,14 +102,26 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 		},
 		Ender: []string{"<"},
 		Error: map[string]string{
-			"xml_mismatched_tag": "closing tag </$fsrc> does not match opening tag <$openname>",
-			"xml_invalid_tag":    "invalid tag: $fsrc",
-			"xml_unterminated":   "unterminated $kind",
+			"xml_mismatched_tag":       "closing tag </$fsrc> does not match opening tag <$openname>",
+			"xml_invalid_tag":          "invalid tag: $fsrc",
+			"xml_unterminated":         "unterminated $kind",
+			"comment_double_dash":      "comment body cannot contain \"--\"",
+			"cdata_terminator_in_text": "character data cannot contain \"]]>\"",
+			"pi_target_invalid":        "processing instruction target is missing or invalid",
+			"lt_in_attr_value":         "\"<\" is not allowed in an attribute value",
+			"bad_entity_ref":           "malformed entity reference (need &name; or &#NNN; or &#xHHH;)",
+			"duplicate_attribute":      "duplicate attribute name in tag",
 		},
 		Hint: map[string]string{
-			"xml_mismatched_tag": "Each opening tag must be paired with a matching closing tag.\nExpected </$openname> but found </$fsrc>.",
-			"xml_invalid_tag":    "The tag syntax is not valid XML.",
-			"xml_unterminated":   "The $kind starting at this position is not terminated.",
+			"xml_mismatched_tag":       "Each opening tag must be paired with a matching closing tag.\nExpected </$openname> but found </$fsrc>.",
+			"xml_invalid_tag":          "The tag syntax is not valid XML.",
+			"xml_unterminated":         "The $kind starting at this position is not terminated.",
+			"comment_double_dash":      "XML 1.0 disallows \"--\" inside a comment body.",
+			"cdata_terminator_in_text": "The literal \"]]>\" must only appear as the end of a CDATA section.",
+			"pi_target_invalid":        "A processing instruction must start with a Name; the XML declaration <?xml...?> is the special case.",
+			"lt_in_attr_value":         "Use the entity reference &lt; to include \"<\" in an attribute value.",
+			"bad_entity_ref":           "Replace literal \"&\" with &amp;, or terminate the entity reference with \";\".",
+			"duplicate_attribute":      "Each attribute name in an open tag must be unique.",
 		},
 	})
 
@@ -117,6 +129,13 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 		// Pure XML mode: reconfigure the parser so Jsonic's own value
 		// grammar is unreachable and all lexers other than our tag
 		// matcher are quiescent.
+		//
+		// Note: we deliberately do NOT install a Text.Modify hook
+		// here. While the root element is open the custom matcher
+		// itself emits the text tokens (with entity decoding and
+		// well-formedness checks); Jsonic's text matcher only sees
+		// whitespace before and after the root element where no
+		// decoding is needed.
 		j.SetOptions(jsonic.Options{
 			Rule: &jsonic.RuleOptions{
 				Start:   "xml",
@@ -132,14 +151,6 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 			Comment: &jsonic.CommentOptions{Lex: boolPtr(false)},
 			Space:   &jsonic.SpaceOptions{Lex: boolPtr(false)},
 			Line:    &jsonic.LineOptions{Lex: boolPtr(false)},
-			Text: &jsonic.TextOptions{
-				Modify: []jsonic.ValModifier{func(v any) any {
-					if s, ok := v.(string); ok && entitiesOn {
-						return decode(s)
-					}
-					return v
-				}},
-			},
 		})
 	}
 
@@ -442,6 +453,7 @@ func buildXmlTagMatcher(
 	embed bool,
 	xigTin, xopTin, xclTin, xscTin jsonic.Tin,
 ) jsonic.MakeLexMatcher {
+	_ = embed // embed flag is no longer needed for text-handling
 	return func(_ *jsonic.LexConfig, _ *jsonic.Options) jsonic.LexMatcher {
 		return func(lex *jsonic.Lex, _ *jsonic.Rule) *jsonic.Token {
 			pnt := lex.Cursor()
@@ -449,11 +461,11 @@ func buildXmlTagMatcher(
 			srclen := len(src)
 			sI := pnt.SI
 
-			// Embed mode: inside an open XML element (depth > 0),
-			// consume characters up to the next `<` as a single #TX
-			// text token so that Jsonic's own matchers don't reinterpret
-			// commas/colons/etc. as JSON separators.
-			if embed && sI < srclen && src[sI] != '<' {
+			// Inside an open XML element (depth > 0), consume
+			// characters up to the next `<` as a single #TX text
+			// token. Validates well-formedness of character data:
+			// rejects "]]>" and bare/malformed entity references.
+			if sI < srclen && src[sI] != '<' {
 				if depth := xmlDepth(lex); depth > 0 {
 					i := sI
 					for i < srclen && src[i] != '<' {
@@ -463,6 +475,12 @@ func buildXmlTagMatcher(
 						return nil
 					}
 					raw := src[sI:i]
+					if strings.Contains(raw, "]]>") {
+						return lex.Bad("cdata_terminator_in_text")
+					}
+					if code := checkEntityRefs(raw); code != "" {
+						return lex.Bad(code)
+					}
 					var val any = raw
 					if entitiesOn {
 						val = decode(raw)
@@ -483,7 +501,13 @@ func buildXmlTagMatcher(
 				if end < 0 {
 					return lex.Bad("unterminated_comment")
 				}
-				finish := sI + 4 + end + 3
+				bodyStart := sI + 4
+				bodyEnd := bodyStart + end
+				// WF: "--" must not occur in a comment body.
+				if strings.Contains(src[bodyStart:bodyEnd], "--") {
+					return lex.Bad("comment_double_dash")
+				}
+				finish := bodyEnd + 3
 				tsrc := src[sI:finish]
 				tkn := lex.Token("#XIG", xigTin, tsrc, tsrc)
 				advance(pnt, sI, finish)
@@ -536,7 +560,20 @@ func buildXmlTagMatcher(
 				if end < 0 {
 					return lex.Bad("unterminated_pi")
 				}
-				finish := sI + 2 + end + 2
+				bodyEnd := sI + 2 + end
+				// WF: PI target must be a Name.
+				i := sI + 2
+				if i >= bodyEnd || !isNameStart(src[i]) {
+					return lex.Bad("pi_target_invalid")
+				}
+				i++
+				for i < bodyEnd && isNameChar(src[i]) {
+					i++
+				}
+				if i < bodyEnd && !isSpace(src[i]) {
+					return lex.Bad("pi_target_invalid")
+				}
+				finish := bodyEnd + 2
 				tsrc := src[sI:finish]
 				tkn := lex.Token("#XIG", xigTin, tsrc, tsrc)
 				advance(pnt, sI, finish)
@@ -546,8 +583,9 @@ func buildXmlTagMatcher(
 			// Closing tag: </name>
 			if sI+1 < srclen && src[sI+1] == '/' {
 				i := sI + 2
+				// WF: empty close tag `</>` is invalid.
 				if i >= srclen || !isNameStart(src[i]) {
-					return nil
+					return lex.Bad("xml_invalid_tag")
 				}
 				nameStart := i
 				i++
@@ -565,9 +603,7 @@ func buildXmlTagMatcher(
 				tsrc := src[sI:finish]
 				tkn := lex.Token("#XCL", xclTin, name, tsrc)
 				advance(pnt, sI, finish)
-				if embed {
-					setXmlDepth(lex, xmlDepth(lex)-1)
-				}
+				setXmlDepth(lex, xmlDepth(lex)-1)
 				return tkn
 			}
 
@@ -600,9 +636,7 @@ func buildXmlTagMatcher(
 					val := map[string]any{"name": name, "attributes": attrs}
 					tkn := lex.Token("#XOP", xopTin, val, tsrc)
 					advance(pnt, sI, finish)
-					if embed {
-						setXmlDepth(lex, xmlDepth(lex)+1)
-					}
+					setXmlDepth(lex, xmlDepth(lex)+1)
 					return tkn
 				}
 				if src[i] == '/' && i+1 < srclen && src[i+1] == '>' {
@@ -651,7 +685,13 @@ func buildXmlTagMatcher(
 				}
 				i++
 				valStart := i
+				// Per the XML 1.0 spec, attribute values cannot contain
+				// a literal `<`. Scanning lets us also validate entity
+				// references in the value below.
 				for i < srclen && src[i] != quote {
+					if src[i] == '<' {
+						return lex.Bad("lt_in_attr_value")
+					}
 					i++
 				}
 				if i >= srclen {
@@ -659,10 +699,81 @@ func buildXmlTagMatcher(
 				}
 				raw := src[valStart:i]
 				i++ // consume closing quote
+
+				if code := checkEntityRefs(raw); code != "" {
+					return lex.Bad(code)
+				}
+				if _, ok := attrs[attrName]; ok {
+					return lex.Bad("duplicate_attribute")
+				}
 				attrs[attrName] = decode(raw)
 			}
 		}
 	}
+}
+
+// checkEntityRefs validates that every `&` in `s` begins a well-formed
+// entity reference. Returns "" on success, otherwise an error code
+// suitable for lex.Bad().
+//
+// Well-formed forms:
+//
+//	&name;     - name must start with a NameStartChar
+//	&#nnnn;    - decimal numeric character reference
+//	&#xhhhh;   - hexadecimal numeric character reference
+func checkEntityRefs(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '&' {
+			continue
+		}
+		semi := strings.IndexByte(s[i+1:], ';')
+		if semi < 0 {
+			return "bad_entity_ref"
+		}
+		semi += i + 1
+		ref := s[i+1 : semi]
+		if len(ref) == 0 {
+			return "bad_entity_ref"
+		}
+		if ref[0] == '#' {
+			if len(ref) < 2 {
+				return "bad_entity_ref"
+			}
+			var digits string
+			var hex bool
+			if ref[1] == 'x' || ref[1] == 'X' {
+				hex = true
+				digits = ref[2:]
+			} else {
+				digits = ref[1:]
+			}
+			if len(digits) == 0 {
+				return "bad_entity_ref"
+			}
+			for _, d := range digits {
+				if hex {
+					if !((d >= '0' && d <= '9') || (d >= 'a' && d <= 'f') || (d >= 'A' && d <= 'F')) {
+						return "bad_entity_ref"
+					}
+				} else {
+					if !(d >= '0' && d <= '9') {
+						return "bad_entity_ref"
+					}
+				}
+			}
+		} else {
+			if !isNameStart(ref[0]) {
+				return "bad_entity_ref"
+			}
+			for k := 1; k < len(ref); k++ {
+				if !isNameChar(ref[k]) {
+					return "bad_entity_ref"
+				}
+			}
+		}
+		i = semi
+	}
+	return ""
 }
 
 // resolveNamespaces annotates `element` (and its descendants) with

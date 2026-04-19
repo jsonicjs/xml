@@ -131,6 +131,12 @@ const Xml: Plugin = (jsonic: Jsonic, options: XmlOptions) => {
     // Pure XML mode: reconfigure the parser so Jsonic's own value
     // grammar is unreachable and all lexers other than our tag matcher
     // are quiescent.
+    //
+    // Note: we deliberately do NOT install a `text.modify` hook here.
+    // While the root element is open the custom matcher itself emits
+    // the text tokens (with entity decoding and well-formedness
+    // checks); Jsonic's text matcher only sees whitespace before the
+    // root and after it, where no decoding is needed.
     jsonic.options({
       rule: {
         start: 'xml',
@@ -151,12 +157,6 @@ const Xml: Plugin = (jsonic: Jsonic, options: XmlOptions) => {
       comment: { lex: false },
       space:   { lex: false },
       line:    { lex: false },
-      text: {
-        modify: (val: any) =>
-          'string' === typeof val && options.entities !== false
-            ? decodeEntity(val)
-            : val,
-      },
     })
   } else {
     // Embed mode: keep all of Jsonic's standard grammar. Still register
@@ -175,12 +175,24 @@ const Xml: Plugin = (jsonic: Jsonic, options: XmlOptions) => {
         'closing tag </$fsrc> does not match opening tag <$openname>',
       xml_invalid_tag: 'invalid tag: $fsrc',
       xml_unterminated: 'unterminated $kind',
+      comment_double_dash: 'comment body cannot contain "--"',
+      cdata_terminator_in_text: 'character data cannot contain "]]>"',
+      pi_target_invalid: 'processing instruction target is missing or invalid',
+      lt_in_attr_value: '"<" is not allowed in an attribute value',
+      bad_entity_ref: 'malformed entity reference (need &name; or &#NNN; or &#xHHH;)',
+      duplicate_attribute: 'duplicate attribute name in tag',
     },
     hint: {
       xml_mismatched_tag: `Each opening tag must be paired with a matching closing tag.
 Expected </$openname> but found </$fsrc>.`,
       xml_invalid_tag: `The tag syntax is not valid XML.`,
       xml_unterminated: `The $kind starting at this position is not terminated.`,
+      comment_double_dash: `XML 1.0 disallows "--" inside a comment body.`,
+      cdata_terminator_in_text: `The literal "]]>" must only appear as the end of a CDATA section.`,
+      pi_target_invalid: `A processing instruction must start with a Name; the XML declaration <?xml...?> is the special case.`,
+      lt_in_attr_value: `Use the entity reference &lt; to include "<" in an attribute value.`,
+      bad_entity_ref: `Replace literal "&" with &amp;, or terminate the entity reference with ";".`,
+      duplicate_attribute: `Each attribute name in an open tag must be unique.`,
     },
   })
 
@@ -341,24 +353,46 @@ function buildXmlTagMatcher(
   const isSpace = (ch: string) =>
     ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r'
 
+  // Validate and decode a run of character data (non-CDATA). Enforces
+  // the XML 1.0 well-formedness constraints applicable to text:
+  //   - the literal sequence "]]>" must not appear in character data;
+  //   - every "&" must start a well-formed entity reference.
+  // Returns either { val: string } on success or { err: string } if a
+  // WF constraint is violated. Pure decoding (without validation) is
+  // also available for CDATA bodies via decodeEntity().
+  function processText(raw: string): { val?: string; err?: string } {
+    if (raw.indexOf(']]>') >= 0) {
+      return { err: 'cdata_terminator_in_text' }
+    }
+    const ampErr = checkEntityRefs(raw)
+    if (ampErr) return { err: ampErr }
+    return {
+      val: options.entities !== false ? decodeEntity(raw) : raw,
+    }
+  }
+
   return function makeXmlTagMatcher(_cfg: Config, _opts: Options) {
     return function xmlTagMatcher(lex: Lex) {
       const { pnt, src } = lex
       const sI = pnt.sI
 
-      // Embed mode: inside an open XML element (depth > 0), consume
-      // characters up to the next `<` as a single #TX text token so
-      // that Jsonic's own matchers don't reinterpret commas/colons/etc
-      // as JSON separators.
-      if (embed && sI < src.length && src[sI] !== '<') {
+      // Inside an open XML element (depth > 0), consume characters up
+      // to the next `<` as a single #TX text token so that Jsonic's
+      // own matchers don't reinterpret commas/colons/etc. as JSON
+      // separators in embed mode, and so we can apply XML text
+      // validation in pure mode too.
+      if (sI < src.length && src[sI] !== '<') {
         const depth = (lex.ctx?.u?.xmlDepth | 0) || 0
         if (depth > 0) {
           let i = sI
           while (i < src.length && src[i] !== '<') i++
           if (i === sI) return undefined
           const raw = src.substring(sI, i)
-          const val = options.entities !== false ? decodeEntity(raw) : raw
-          const tkn = lex.token('#TX', val, raw, pnt)
+          const result = processText(raw)
+          if (result.err) {
+            return lex.bad(result.err, sI, i)
+          }
+          const tkn = lex.token('#TX', result.val, raw, pnt)
           pnt.sI = i
           pnt.cI += i - sI
           return tkn
@@ -372,6 +406,11 @@ function buildXmlTagMatcher(
         const endIdx = src.indexOf('-->', sI + 4)
         if (endIdx === -1) {
           return lex.bad('unterminated_comment', sI, src.length)
+        }
+        // WF constraint: "--" must not occur in a comment body.
+        const body = src.substring(sI + 4, endIdx)
+        if (body.indexOf('--') >= 0) {
+          return lex.bad('comment_double_dash', sI, endIdx + 3)
         }
         const end = endIdx + 3
         const tkn = lex.token('#XIG', src.substring(sI, end), src.substring(sI, end), pnt)
@@ -421,6 +460,17 @@ function buildXmlTagMatcher(
         if (endIdx === -1) {
           return lex.bad('unterminated_pi', sI, src.length)
         }
+        // WF constraint: PI target must be a Name (and not empty).
+        let i = sI + 2
+        if (i >= src.length || !isNameStart(src[i])) {
+          return lex.bad('pi_target_invalid', sI, endIdx + 2)
+        }
+        i++
+        while (i < endIdx && isNameChar(src[i])) i++
+        // After the target, only whitespace then content is allowed.
+        if (i < endIdx && !isSpace(src[i])) {
+          return lex.bad('pi_target_invalid', sI, endIdx + 2)
+        }
         const end = endIdx + 2
         const tkn = lex.token('#XIG', src.substring(sI, end), src.substring(sI, end), pnt)
         pnt.sI = end
@@ -431,8 +481,11 @@ function buildXmlTagMatcher(
       // Closing tag: </name>
       if (src[sI + 1] === '/') {
         let i = sI + 2
+        // WF: empty close tag `</>` is invalid.
+        if (i >= src.length || !isNameStart(src[i])) {
+          return lex.bad('xml_invalid_tag', sI, Math.min(src.length, i + 1))
+        }
         const nameStart = i
-        if (i >= src.length || !isNameStart(src[i])) return undefined
         i++
         while (i < src.length && isNameChar(src[i])) i++
         const name = src.substring(nameStart, i)
@@ -444,7 +497,7 @@ function buildXmlTagMatcher(
         const tkn = lex.token('#XCL', name, src.substring(sI, end), pnt)
         pnt.sI = end
         pnt.cI += end - sI
-        if (embed && lex.ctx) {
+        if (lex.ctx) {
           const u: any = lex.ctx.u || (lex.ctx.u = {})
           u.xmlDepth = Math.max(0, (u.xmlDepth | 0) - 1)
         }
@@ -472,7 +525,7 @@ function buildXmlTagMatcher(
           const tkn = lex.token('#XOP', { name, attributes }, src.substring(sI, end), pnt)
           pnt.sI = end
           pnt.cI += end - sI
-          if (embed && lex.ctx) {
+          if (lex.ctx) {
             const u: any = lex.ctx.u || (lex.ctx.u = {})
             u.xmlDepth = (u.xmlDepth | 0) + 1
           }
@@ -512,17 +565,66 @@ function buildXmlTagMatcher(
         }
         i++
         const valStart = i
-        while (i < src.length && src[i] !== quote) i++
+        // Per the XML 1.0 spec, attribute values cannot contain a
+        // literal `<`. Tracking the position lets us also validate
+        // entity references in the value.
+        while (i < src.length && src[i] !== quote) {
+          if (src[i] === '<') {
+            return lex.bad('lt_in_attr_value', sI, i + 1)
+          }
+          i++
+        }
         if (i >= src.length) {
           return lex.bad('xml_invalid_tag', sI, src.length)
         }
         const rawVal = src.substring(valStart, i)
         i++
 
+        const ampErr = checkEntityRefs(rawVal)
+        if (ampErr) {
+          return lex.bad(ampErr, valStart, i)
+        }
+        if (Object.prototype.hasOwnProperty.call(attributes, attrName)) {
+          return lex.bad('duplicate_attribute', sI, i)
+        }
         attributes[attrName] = decodeEntity(rawVal)
       }
     }
   }
+}
+
+
+// Validate entity references in a run of character data. Returns an
+// error code on the first malformed reference, or '' if every `&`
+// in the input is part of a well-formed reference.
+//
+// Well-formed forms:
+//   &name;       — name must start with a NameStartChar
+//   &#nnnn;      — decimal numeric character reference
+//   &#xhhhh;     — hexadecimal numeric character reference
+function checkEntityRefs(s: string): string {
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== '&') continue
+    const semi = s.indexOf(';', i + 1)
+    if (semi < 0) return 'bad_entity_ref'
+    const ref = s.substring(i + 1, semi)
+    if (ref.length === 0) return 'bad_entity_ref'
+    if (ref[0] === '#') {
+      if (ref.length < 2) return 'bad_entity_ref'
+      const digits = ref[1] === 'x' || ref[1] === 'X'
+        ? ref.substring(2)
+        : ref.substring(1)
+      if (digits.length === 0) return 'bad_entity_ref'
+      const valid = ref[1] === 'x' || ref[1] === 'X'
+        ? /^[0-9a-fA-F]+$/.test(digits)
+        : /^[0-9]+$/.test(digits)
+      if (!valid) return 'bad_entity_ref'
+    } else {
+      if (!/^[A-Za-z_:][A-Za-z0-9_\-\.:]*$/.test(ref)) return 'bad_entity_ref'
+    }
+    i = semi
+  }
+  return ''
 }
 
 
