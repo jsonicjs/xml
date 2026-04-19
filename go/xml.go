@@ -15,10 +15,12 @@
 package xml
 
 import (
+	"encoding/binary"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	jsonic "github.com/jsonicjs/jsonic/go"
@@ -382,6 +384,57 @@ func setXmlDepth(lex *jsonic.Lex, d int) {
 	lex.Ctx.U["xmlDepth"] = d
 }
 
+// DecodeBOM detects a byte-order mark at the start of `src` and, when
+// the input is encoded as UTF-16 LE/BE or UTF-32 LE/BE, returns a
+// transcoded UTF-8 string. UTF-8 BOMs are returned with the BOM bytes
+// stripped. For input without a recognised BOM, the original string
+// is returned unchanged.
+//
+// Use this when feeding XML files of unknown encoding into the
+// parser:
+//
+//	body, _ := os.ReadFile(path)
+//	doc, err := j.Parse(xml.DecodeBOM(string(body)))
+func DecodeBOM(src string) string {
+	b := []byte(src)
+	n := len(b)
+	switch {
+	case n >= 4 && b[0] == 0x00 && b[1] == 0x00 && b[2] == 0xfe && b[3] == 0xff:
+		return decodeUTF32(b[4:], binary.BigEndian)
+	case n >= 4 && b[0] == 0xff && b[1] == 0xfe && b[2] == 0x00 && b[3] == 0x00:
+		return decodeUTF32(b[4:], binary.LittleEndian)
+	case n >= 2 && b[0] == 0xfe && b[1] == 0xff:
+		return decodeUTF16(b[2:], binary.BigEndian)
+	case n >= 2 && b[0] == 0xff && b[1] == 0xfe:
+		return decodeUTF16(b[2:], binary.LittleEndian)
+	case n >= 3 && b[0] == 0xef && b[1] == 0xbb && b[2] == 0xbf:
+		return string(b[3:])
+	}
+	return src
+}
+
+func decodeUTF16(b []byte, order binary.ByteOrder) string {
+	if len(b)%2 != 0 {
+		b = b[:len(b)-1]
+	}
+	units := make([]uint16, len(b)/2)
+	for i := range units {
+		units[i] = order.Uint16(b[i*2:])
+	}
+	return string(utf16.Decode(units))
+}
+
+func decodeUTF32(b []byte, order binary.ByteOrder) string {
+	if len(b)%4 != 0 {
+		b = b[:len(b)-(len(b)%4)]
+	}
+	out := make([]rune, len(b)/4)
+	for i := range out {
+		out[i] = rune(order.Uint32(b[i*4:]))
+	}
+	return string(out)
+}
+
 // firstRule walks back through Prev links to find the originating rule
 // instance (matches the root rule used by the parser as the result
 // holder).
@@ -472,6 +525,13 @@ func buildXmlTagMatcher(
 			src := lex.Src
 			srclen := len(src)
 			sI := pnt.SI
+
+			// Strip a UTF-8 byte-order mark at the very start of input.
+			if sI == 0 && srclen >= 3 &&
+				src[0] == 0xef && src[1] == 0xbb && src[2] == 0xbf {
+				pnt.SI = 3
+				return nil
+			}
 
 			// Inside an open XML element (depth > 0), consume
 			// characters up to the next `<` as a single #TX text

@@ -6,7 +6,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { Jsonic } from 'jsonic'
-import { Xml } from '../dist/xml'
+import { Xml, decodeBOM } from '../dist/xml'
 
 // ---------------------------------------------------------------------------
 // Shared TSV spec runner
@@ -234,7 +234,7 @@ const xmlconfRoot = join(__dirname, '..', 'test', 'xmlconf')
 const xmlconfAvailable = existsSync(join(xmlconfRoot, 'xmltest'))
 
 // Regression guards; raise once parser coverage improves.
-const VALID_SA_PASS_FLOOR = 110
+const VALID_SA_PASS_FLOOR = 118
 const NOT_WF_SA_REJECT_FLOOR = 30
 
 function xmlconfFiles(dir: string): string[] {
@@ -253,7 +253,11 @@ describe('w3c-xml-conformance', { skip: !xmlconfAvailable }, () => {
     let pass = 0
     const failures: string[] = []
     for (const path of files) {
-      const body = readFileSync(path, 'utf8')
+      // Read as a Buffer and let decodeBOM choose the encoding via
+      // the BOM (default UTF-8). This lets the same runner handle the
+      // suite's UTF-8 files (with or without BOM) and the few UTF-16
+      // / UTF-32 documents.
+      const body = decodeBOM(readFileSync(path))
       try {
         parser(body)
         pass++
@@ -276,7 +280,7 @@ describe('w3c-xml-conformance', { skip: !xmlconfAvailable }, () => {
     let rejected = 0
     const falseAccepts: string[] = []
     for (const path of files) {
-      const body = readFileSync(path, 'utf8')
+      const body = decodeBOM(readFileSync(path))
       try {
         parser(body)
         falseAccepts.push(path.split('/').slice(-1)[0])

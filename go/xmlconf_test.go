@@ -25,10 +25,10 @@ import (
 
 const (
 	// Minimum `valid/sa/*.xml` documents that must parse without error
-	// (out of 120). The handful of expected failures are UTF-16/UTF-32
-	// byte-order-marked files and tests that use non-Latin tag names,
-	// both of which are out of scope for the current implementation.
-	validSaPassFloor = 110
+	// (out of 120). The conformance runner pre-decodes BOMs and
+	// supports Unicode tag names, so the floor is set close to the
+	// total.
+	validSaPassFloor = 118
 
 	// Minimum `not-wf/sa/*.xml` documents that must be rejected. The
 	// parser catches structural well-formedness errors (bad tags,
@@ -69,7 +69,10 @@ func xmlconfParse(src string) (any, error) {
 	if err := j.UseDefaults(Xml, Defaults); err != nil {
 		return nil, err
 	}
-	return j.Parse(src)
+	// The conformance suite mixes UTF-8/16/32 encoded files. Detect
+	// the byte-order mark and transcode to UTF-8 so the encoding is
+	// transparent to the parser.
+	return j.Parse(DecodeBOM(src))
 }
 
 func TestXmlConfValidStandalone(t *testing.T) {

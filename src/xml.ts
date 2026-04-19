@@ -300,6 +300,129 @@ Expected </$openname> but found </$fsrc>.`,
 }
 
 
+// decodeBOM converts a byte sequence (either a Node Buffer / Uint8Array
+// or a Latin-1-mapped "binary" JS string where each char code is one
+// byte) into a decoded Unicode string, transcoding from whichever of
+// UTF-8 / UTF-16-LE / UTF-16-BE / UTF-32-LE / UTF-32-BE the byte-order
+// mark indicates. UTF-8 is the default when no BOM is present, so
+// non-ASCII tag names in BOM-less UTF-8 files round-trip correctly.
+//
+// If the caller has already decoded the input to a Unicode JS string
+// (any code unit > 0xFF) the function only strips a leading U+FEFF
+// and returns the input otherwise unchanged.
+//
+// Use this when reading XML files of unknown encoding:
+//
+//   const body = decodeBOM(readFileSync(path))   // Node Buffer
+//   const doc = jsonic(body)
+function decodeBOM(src: any): string {
+  // Already a decoded Unicode string: strip a leading BOM character.
+  if (typeof src === 'string') {
+    let isBinary = true
+    for (let i = 0; i < src.length && i < 1024; i++) {
+      if (src.charCodeAt(i) > 0xff) { isBinary = false; break }
+    }
+    if (!isBinary) {
+      return src.charCodeAt(0) === 0xfeff ? src.substring(1) : src
+    }
+    // Binary string: convert to a byte array and reuse the buffer path.
+    const bytes = new Uint8Array(src.length)
+    for (let i = 0; i < src.length; i++) bytes[i] = src.charCodeAt(i) & 0xff
+    return decodeBOMBytes(bytes)
+  }
+  // Buffer / Uint8Array / array-like.
+  return decodeBOMBytes(src as Uint8Array)
+}
+
+function decodeBOMBytes(b: Uint8Array): string {
+  const n = b.length
+  if (n === 0) return ''
+
+  // UTF-32 BE
+  if (n >= 4 && b[0] === 0x00 && b[1] === 0x00 && b[2] === 0xfe && b[3] === 0xff) {
+    return decodeUTF32(b, 4, true)
+  }
+  // UTF-32 LE (check before UTF-16 LE)
+  if (n >= 4 && b[0] === 0xff && b[1] === 0xfe && b[2] === 0x00 && b[3] === 0x00) {
+    return decodeUTF32(b, 4, false)
+  }
+  // UTF-16 BE
+  if (n >= 2 && b[0] === 0xfe && b[1] === 0xff) {
+    return decodeUTF16(b, 2, true)
+  }
+  // UTF-16 LE
+  if (n >= 2 && b[0] === 0xff && b[1] === 0xfe) {
+    return decodeUTF16(b, 2, false)
+  }
+  // UTF-8 BOM, then UTF-8 default
+  let start = 0
+  if (n >= 3 && b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) start = 3
+  return decodeUTF8(b, start)
+}
+
+function decodeUTF8(b: Uint8Array, start: number): string {
+  let out = ''
+  let i = start
+  const n = b.length
+  while (i < n) {
+    const c = b[i]
+    if (c < 0x80) {
+      out += String.fromCharCode(c)
+      i++
+      continue
+    }
+    let cp = -1
+    let advance = 1
+    if ((c & 0xe0) === 0xc0 && i + 1 < n) {
+      cp = ((c & 0x1f) << 6) | (b[i + 1] & 0x3f)
+      advance = 2
+    } else if ((c & 0xf0) === 0xe0 && i + 2 < n) {
+      cp = ((c & 0x0f) << 12) | ((b[i + 1] & 0x3f) << 6) | (b[i + 2] & 0x3f)
+      advance = 3
+    } else if ((c & 0xf8) === 0xf0 && i + 3 < n) {
+      cp = ((c & 0x07) << 18) |
+        ((b[i + 1] & 0x3f) << 12) |
+        ((b[i + 2] & 0x3f) << 6) |
+        (b[i + 3] & 0x3f)
+      advance = 4
+    }
+    // Reject malformed sequences (invalid lead byte, truncated tail,
+    // or out-of-range code point) by emitting the raw byte and
+    // advancing one position. The downstream XML check will then flag
+    // the offending control / non-Char character.
+    if (cp < 0 || cp > 0x10ffff) {
+      out += String.fromCharCode(c)
+      i++
+    } else {
+      out += String.fromCodePoint(cp)
+      i += advance
+    }
+  }
+  return out
+}
+
+function decodeUTF16(b: Uint8Array, start: number, big: boolean): string {
+  const units: number[] = []
+  for (let i = start; i + 1 < b.length; i += 2) {
+    const a = b[i], c = b[i + 1]
+    units.push(big ? (a << 8) | c : (c << 8) | a)
+  }
+  return String.fromCharCode(...units)
+}
+
+function decodeUTF32(b: Uint8Array, start: number, big: boolean): string {
+  let out = ''
+  for (let i = start; i + 3 < b.length; i += 4) {
+    const a = b[i], c = b[i + 1], d = b[i + 2], e = b[i + 3]
+    const cp = big
+      ? (a << 24) | (c << 16) | (d << 8) | e
+      : (e << 24) | (d << 16) | (c << 8) | a
+    out += String.fromCodePoint(cp >>> 0)
+  }
+  return out
+}
+
+
 // The five predefined XML entities.
 const predefinedEntities: Record<string, string> = {
   amp: '&',
@@ -410,6 +533,24 @@ function buildXmlTagMatcher(
     return function xmlTagMatcher(lex: Lex) {
       const { pnt, src } = lex
       const sI = pnt.sI
+
+      // Strip a UTF-8 byte-order mark at the very start of input.
+      // After decoding, a UTF-8 BOM appears as a single U+FEFF
+      // character; some toolchains pass through the raw bytes
+      // (EF BB BF) as three separate Latin-1 code units.
+      if (sI === 0 && src.length > 0) {
+        if (src.charCodeAt(0) === 0xfeff) {
+          pnt.sI = 1
+          return undefined
+        }
+        if (src.length >= 3 &&
+            src.charCodeAt(0) === 0xef &&
+            src.charCodeAt(1) === 0xbb &&
+            src.charCodeAt(2) === 0xbf) {
+          pnt.sI = 3
+          return undefined
+        }
+      }
 
       // Inside an open XML element (depth > 0), consume characters up
       // to the next `<` as a single #TX text token so that Jsonic's
@@ -777,6 +918,6 @@ Xml.defaults = {
   embed: false,
 } as XmlOptions
 
-export { Xml }
+export { Xml, decodeBOM }
 
 export type { XmlOptions, XmlElement }
