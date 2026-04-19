@@ -556,9 +556,11 @@ func buildXmlTagMatcher(
 					if code := checkEntityRefs(raw); code != "" {
 						return lex.Bad(code)
 					}
-					var val any = raw
+					// §2.11 end-of-line normalisation.
+					normalised := normaliseLineEndings(raw)
+					var val any = normalised
 					if entitiesOn {
-						val = decode(raw)
+						val = decode(normalised)
 					}
 					tkn := lex.Token("#TX", jsonic.TinTX, val, raw)
 					advance(pnt, sI, i)
@@ -606,7 +608,8 @@ func buildXmlTagMatcher(
 					return lex.Bad(code)
 				}
 				tsrc := src[sI:finish]
-				tkn := lex.Token("#TX", jsonic.TinTX, text, tsrc)
+				// §2.11 line-end normalisation applies to CDATA too.
+				tkn := lex.Token("#TX", jsonic.TinTX, normaliseLineEndings(text), tsrc)
 				advance(pnt, sI, finish)
 				return tkn
 			}
@@ -776,10 +779,63 @@ func buildXmlTagMatcher(
 				if _, ok := attrs[attrName]; ok {
 					return lex.Bad("duplicate_attribute")
 				}
-				attrs[attrName] = decode(raw)
+				// §3.3.3 attribute-value normalisation: TAB/LF/CR/CRLF
+				// all collapse to a single SPACE. Without DTD attribute
+				// types, all attributes are treated as CDATA-typed
+				// (no further whitespace collapsing or trimming).
+				normalised := normaliseAttrWhitespace(raw)
+				attrs[attrName] = decode(normalised)
 			}
 		}
 	}
+}
+
+// §2.11 End-of-line handling: any literal CR or CR-LF is normalised
+// to a single LF before parsing proceeds. Applies to character data
+// and CDATA section bodies.
+func normaliseLineEndings(s string) string {
+	if !strings.ContainsRune(s, '\r') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\r' {
+			b.WriteByte('\n')
+			if i+1 < len(s) && s[i+1] == '\n' {
+				i++
+			}
+		} else {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// §3.3.3 attribute-value normalisation for CDATA-typed attributes:
+// TAB / LF / CR / CRLF all collapse to a single SPACE.
+func normaliseAttrWhitespace(s string) string {
+	if !strings.ContainsAny(s, "\t\n\r") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '\t', '\n':
+			b.WriteByte(' ')
+		case '\r':
+			b.WriteByte(' ')
+			if i+1 < len(s) && s[i+1] == '\n' {
+				i++
+			}
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // checkChars validates that every byte in `s` is a legal XML 1.0 Char.

@@ -524,8 +524,10 @@ function buildXmlTagMatcher(
     }
     const ampErr = checkEntityRefs(raw)
     if (ampErr) return { err: ampErr }
+    // §2.11: normalise CR LF and lone CR to LF before downstream processing.
+    const normalised = normaliseLineEndings(raw)
     return {
-      val: options.entities !== false ? decodeEntity(raw) : raw,
+      val: options.entities !== false ? decodeEntity(normalised) : normalised,
     }
   }
 
@@ -609,7 +611,8 @@ function buildXmlTagMatcher(
         if (checkChars(text)) {
           return lex.bad('invalid_xml_char', sI, end)
         }
-        const tkn = lex.token('#TX', text, src.substring(sI, end), pnt)
+        // §2.11 line-end normalisation applies to CDATA too.
+        const tkn = lex.token('#TX', normaliseLineEndings(text), src.substring(sI, end), pnt)
         pnt.sI = end
         pnt.cI += end - sI
         return tkn
@@ -770,12 +773,36 @@ function buildXmlTagMatcher(
         if (Object.prototype.hasOwnProperty.call(attributes, attrName)) {
           return lex.bad('duplicate_attribute', sI, i)
         }
-        attributes[attrName] = decodeEntity(rawVal)
+        // §3.3.3 attribute-value normalisation: literal whitespace
+        // (TAB, LF, CR, CRLF) becomes a single SPACE before any
+        // entity references are decoded. We do not have DTD-supplied
+        // attribute types, so all attributes are treated as CDATA-
+        // typed (no further whitespace collapsing or trimming).
+        const normalised = normaliseAttrWhitespace(rawVal)
+        attributes[attrName] = decodeEntity(normalised)
       }
     }
   }
 }
 
+
+// §2.11 End-of-line handling: any literal CR (#xD) or CR-LF
+// (#xD #xA) is normalised to a single LF (#xA) before parsing
+// proceeds. Applies to character data, CDATA section bodies, and is
+// the precondition for §3.3.3 attribute-value normalisation.
+function normaliseLineEndings(s: string): string {
+  if (s.indexOf('\r') < 0) return s
+  return s.replace(/\r\n?/g, '\n')
+}
+
+// §3.3.3 attribute-value normalisation for CDATA-typed attributes
+// (the default in the absence of a DTD). All TAB, LF, CR, and CRLF
+// occurrences in the source are replaced by a single SPACE; runs are
+// not further collapsed and the value is not trimmed.
+function normaliseAttrWhitespace(s: string): string {
+  if (!/[\r\n\t]/.test(s)) return s
+  return s.replace(/\r\n?|[\t\n]/g, ' ')
+}
 
 // XML 1.0 Fifth Edition NameStartChar (§2.3 [4]). The non-Latin
 // ranges below cover the characters allowed at the start of an

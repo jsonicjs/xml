@@ -13,3 +13,6 @@ attr-name-dash	<a data-x="1"/>	{"name":"a","localName":"a","attributes":{"data-x
 attr-name-dot	<a v.2="ok"/>	{"name":"a","localName":"a","attributes":{"v.2":"ok"},"children":[]}
 attr-empty-value	<a x=""/>	{"name":"a","localName":"a","attributes":{"x":""},"children":[]}
 attr-mixed-quotes	<a x="1" y='2'/>	{"name":"a","localName":"a","attributes":{"x":"1","y":"2"},"children":[]}
+attr-tab-normalised	<a x="line1\tline2"/>	{"name":"a","localName":"a","attributes":{"x":"line1 line2"},"children":[]}
+attr-newline-normalised	<a x="line1\nline2"/>	{"name":"a","localName":"a","attributes":{"x":"line1 line2"},"children":[]}
+attr-crlf-normalised	<a x="line1\r\nline2"/>	{"name":"a","localName":"a","attributes":{"x":"line1 line2"},"children":[]}

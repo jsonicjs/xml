@@ -27,3 +27,5 @@ tag-name-dot	<a.b>x</a.b>	{"name":"a.b","localName":"a.b","attributes":{},"child
 tag-name-underscore	<a_b>x</a_b>	{"name":"a_b","localName":"a_b","attributes":{},"children":["x"]}
 tag-name-unicode-thai	<เจมส์>x</เจมส์>	{"name":"เจมส์","localName":"เจมส์","attributes":{},"children":["x"]}
 tag-name-unicode-greek	<Ωmega>x</Ωmega>	{"name":"Ωmega","localName":"Ωmega","attributes":{},"children":["x"]}
+text-crlf-normalised	<a>line1\r\nline2</a>	{"name":"a","localName":"a","attributes":{},"children":["line1\nline2"]}
+text-cr-normalised	<a>line1\rline2</a>	{"name":"a","localName":"a","attributes":{},"children":["line1\nline2"]}
