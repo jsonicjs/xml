@@ -27,6 +27,13 @@ type XmlElement = {
   prefix?: string
   localName: string
   namespace?: string
+  // Effective xml:space (XML 1.0 §2.10). Present only when the
+  // element or an ancestor sets xml:space to something other than
+  // the default value "default" (typically "preserve").
+  space?: string
+  // Effective xml:lang (XML 1.0 §2.12). Present only when the
+  // element or an ancestor specifies xml:lang.
+  lang?: string
   attributes: Record<string, string>
   children: Array<XmlElement | string>
 }
@@ -897,21 +904,42 @@ function checkEntityRefs(s: string): string {
 }
 
 
-// Resolve namespaces on an element tree. Walks the tree maintaining a
-// scope map of `prefix` -> `namespace URI`. The empty-string key holds
-// the default namespace.
-function resolveNamespaces(
-  element: XmlElement,
-  scope: Record<string, string>,
-) {
-  const localScope: Record<string, string> = { ...scope }
+// Resolve namespaces on an element tree. Walks the tree once,
+// maintaining four kinds of inherited state:
+//
+//   ns      - prefix → namespace URI (empty key = default ns), per
+//             XML Namespaces 1.0
+//   space   - active xml:space value ('default' or 'preserve'),
+//             inherited per XML 1.0 §2.10
+//   lang    - active xml:lang value, inherited per XML 1.0 §2.12
+//
+// `space` and `lang` are recorded on each element only when they are
+// non-default (so plain documents don't sprout extra fields).
+type XmlScope = {
+  ns: Record<string, string>
+  space: string
+  lang: string
+}
+
+function resolveNamespaces(element: XmlElement, scope: Record<string, string>) {
+  resolveScope(element, { ns: scope, space: 'default', lang: '' })
+}
+
+function resolveScope(element: XmlElement, scope: XmlScope) {
+  const ns = { ...scope.ns }
+  let space = scope.space
+  let lang = scope.lang
 
   for (const key of Object.keys(element.attributes || {})) {
     const val = element.attributes[key]
     if (key === 'xmlns') {
-      localScope[''] = val
+      ns[''] = val
     } else if (key.startsWith('xmlns:')) {
-      localScope[key.substring(6)] = val
+      ns[key.substring(6)] = val
+    } else if (key === 'xml:space') {
+      space = val
+    } else if (key === 'xml:lang') {
+      lang = val
     }
   }
 
@@ -920,19 +948,23 @@ function resolveNamespaces(
     const prefix = element.name.substring(0, colonIdx)
     element.prefix = prefix
     element.localName = element.name.substring(colonIdx + 1)
-    if (localScope[prefix]) {
-      element.namespace = localScope[prefix]
+    if (ns[prefix]) {
+      element.namespace = ns[prefix]
     }
   } else {
     element.localName = element.name
-    if (localScope['']) {
-      element.namespace = localScope['']
+    if (ns['']) {
+      element.namespace = ns['']
     }
   }
 
+  if (space !== 'default') (element as any).space = space
+  if (lang !== '') (element as any).lang = lang
+
+  const childScope: XmlScope = { ns, space, lang }
   for (const child of element.children) {
     if (child && 'object' === typeof child) {
-      resolveNamespaces(child, localScope)
+      resolveScope(child, childScope)
     }
   }
 }

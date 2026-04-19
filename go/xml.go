@@ -930,21 +930,49 @@ func checkEntityRefs(s string) string {
 	return ""
 }
 
+// xmlScope tracks state inherited down an XML tree:
+//
+//   ns    - prefix -> namespace URI (XML Namespaces 1.0)
+//   space - active xml:space value (XML 1.0 §2.10)
+//   lang  - active xml:lang value (XML 1.0 §2.12)
+//
+// `space` and `lang` are recorded on each element only when they
+// are non-default, so plain documents don't sprout extra fields.
+type xmlScope struct {
+	ns    map[string]string
+	space string
+	lang  string
+}
+
 // resolveNamespaces annotates `element` (and its descendants) with
-// `prefix`, `localName` and `namespace` fields resolved from xmlns /
-// xmlns:* attributes in scope.
+// `prefix`, `localName`, `namespace`, `space` and `lang` fields
+// resolved from xmlns / xmlns:* / xml:space / xml:lang attributes
+// in scope.
 func resolveNamespaces(element map[string]any, scope map[string]string) {
-	local := make(map[string]string, len(scope)+4)
-	for k, v := range scope {
-		local[k] = v
+	resolveScope(element, xmlScope{ns: scope, space: "default", lang: ""})
+}
+
+func resolveScope(element map[string]any, scope xmlScope) {
+	local := xmlScope{
+		ns:    make(map[string]string, len(scope.ns)+4),
+		space: scope.space,
+		lang:  scope.lang,
+	}
+	for k, v := range scope.ns {
+		local.ns[k] = v
 	}
 	if attrs, ok := element["attributes"].(map[string]any); ok {
 		for k, v := range attrs {
 			s, _ := v.(string)
-			if k == "xmlns" {
-				local[""] = s
-			} else if strings.HasPrefix(k, "xmlns:") {
-				local[k[6:]] = s
+			switch {
+			case k == "xmlns":
+				local.ns[""] = s
+			case strings.HasPrefix(k, "xmlns:"):
+				local.ns[k[6:]] = s
+			case k == "xml:space":
+				local.space = s
+			case k == "xml:lang":
+				local.lang = s
 			}
 		}
 	}
@@ -954,20 +982,27 @@ func resolveNamespaces(element map[string]any, scope map[string]string) {
 		prefix := name[:idx]
 		element["prefix"] = prefix
 		element["localName"] = name[idx+1:]
-		if uri, ok := local[prefix]; ok {
+		if uri, ok := local.ns[prefix]; ok {
 			element["namespace"] = uri
 		}
 	} else {
 		element["localName"] = name
-		if uri, ok := local[""]; ok {
+		if uri, ok := local.ns[""]; ok {
 			element["namespace"] = uri
 		}
+	}
+
+	if local.space != "default" {
+		element["space"] = local.space
+	}
+	if local.lang != "" {
+		element["lang"] = local.lang
 	}
 
 	children, _ := element["children"].([]any)
 	for _, c := range children {
 		if ce, ok := c.(map[string]any); ok {
-			resolveNamespaces(ce, local)
+			resolveScope(ce, local)
 		}
 	}
 }
