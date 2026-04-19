@@ -1,0 +1,12 @@
+# name	input	expected	opts
+# Namespace resolution. The parser annotates elements with `prefix`,
+# `localName` and `namespace` derived from xmlns/xmlns:* declarations in
+# scope. Namespace declarations remain in the `attributes` map.
+
+default-ns	<a xmlns="http://example.com"><b/></a>	{"name":"a","localName":"a","namespace":"http://example.com","attributes":{"xmlns":"http://example.com"},"children":[{"name":"b","localName":"b","namespace":"http://example.com","attributes":{},"children":[]}]}
+prefix-ns	<root xmlns:x="http://x.example"><x:a x:k="v">body</x:a></root>	{"name":"root","localName":"root","attributes":{"xmlns:x":"http://x.example"},"children":[{"name":"x:a","prefix":"x","localName":"a","namespace":"http://x.example","attributes":{"x:k":"v"},"children":["body"]}]}
+prefix-inherited	<a xmlns:p="http://p.example"><p:b><p:c/></p:b></a>	{"name":"a","localName":"a","attributes":{"xmlns:p":"http://p.example"},"children":[{"name":"p:b","prefix":"p","localName":"b","namespace":"http://p.example","attributes":{},"children":[{"name":"p:c","prefix":"p","localName":"c","namespace":"http://p.example","attributes":{},"children":[]}]}]}
+default-override	<a xmlns="A"><b xmlns="B"><c/></b><d/></a>	{"name":"a","localName":"a","namespace":"A","attributes":{"xmlns":"A"},"children":[{"name":"b","localName":"b","namespace":"B","attributes":{"xmlns":"B"},"children":[{"name":"c","localName":"c","namespace":"B","attributes":{},"children":[]}]},{"name":"d","localName":"d","namespace":"A","attributes":{},"children":[]}]}
+namespaces-disabled	<a xmlns="http://example.com"/>	{"name":"a","localName":"a","attributes":{"xmlns":"http://example.com"},"children":[]}	{"namespaces":false}
+xml-prefix-implicit	<a xml:lang="en"/>	{"name":"a","localName":"a","attributes":{"xml:lang":"en"},"lang":"en","children":[]}
+xml-prefix-explicit-correct-uri	<a xmlns:xml="http://www.w3.org/XML/1998/namespace"/>	{"name":"a","localName":"a","attributes":{"xmlns:xml":"http://www.w3.org/XML/1998/namespace"},"children":[]}

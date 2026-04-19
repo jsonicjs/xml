@@ -1,0 +1,16 @@
+# name	input	expected	opts
+# DOCTYPE-declared general internal entities. The plugin parses
+# `<!ENTITY name "value">` declarations from the internal subset,
+# stores them per-parse, and uses them to resolve `&name;` in text
+# and attribute values (recursively, with cycle detection).
+
+dtd-entity-basic-text	<!DOCTYPE doc [<!ENTITY foo "bar">]><doc>&foo;</doc>	{"name":"doc","localName":"doc","attributes":{},"children":["bar"]}
+dtd-entity-mixed-text	<!DOCTYPE doc [<!ENTITY x "world">]><doc>hello &x;!</doc>	{"name":"doc","localName":"doc","attributes":{},"children":["hello world!"]}
+dtd-entity-in-attribute	<!DOCTYPE doc [<!ENTITY x "world">]><doc a="hello &x;"/>	{"name":"doc","localName":"doc","attributes":{"a":"hello world"},"children":[]}
+dtd-entity-single-quoted	<!DOCTYPE doc [<!ENTITY x 'plain'>]><doc>&x;</doc>	{"name":"doc","localName":"doc","attributes":{},"children":["plain"]}
+dtd-entity-numeric-ref-in-value	<!DOCTYPE doc [<!ENTITY x "&#65;">]><doc>&x;</doc>	{"name":"doc","localName":"doc","attributes":{},"children":["A"]}
+dtd-entity-recursive	<!DOCTYPE d [<!ENTITY a "AAA"><!ENTITY b "BB&a;BB">]><d>&b;</d>	{"name":"d","localName":"d","attributes":{},"children":["BBAAABB"]}
+dtd-entity-multi-decl	<!DOCTYPE d [<!ENTITY a "1"><!ENTITY b "2"><!ENTITY c "3">]><d>&a;&b;&c;</d>	{"name":"d","localName":"d","attributes":{},"children":["123"]}
+dtd-entity-parameter-ignored	<!DOCTYPE d [<!ENTITY % ignored "X"><!ENTITY g "G">]><d>&g;</d>	{"name":"d","localName":"d","attributes":{},"children":["G"]}
+dtd-entity-external-ignored	<!DOCTYPE d [<!ENTITY ext SYSTEM "ignored.dtd"><!ENTITY g "ok">]><d>&g;</d>	{"name":"d","localName":"d","attributes":{},"children":["ok"]}
+dtd-entity-predefined-overrides	<!DOCTYPE d [<!ENTITY amp "Z">]><d>&amp;</d>	{"name":"d","localName":"d","attributes":{},"children":["&"]}
