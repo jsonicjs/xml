@@ -198,63 +198,83 @@ func TestStructureSpec(t *testing.T)  { runSpecFile(t, filepath.Join(specDir(), 
 func TestErrorsSpec(t *testing.T)     { runSpecFile(t, filepath.Join(specDir(), "errors.tsv")) }
 func TestW3CSpec(t *testing.T)        { runSpecFile(t, filepath.Join(specDir(), "w3c.tsv")) }
 
-// --- XML embedded in Jsonic source -----------------------------------------
+// --- XML literals embedded in Jsonic source --------------------------------
 //
-// Real-world use case: a Jsonic document holds an XML payload as a string.
-// Parse the outer document with stock Jsonic, then feed the embedded XML
-// string into a second Jsonic instance configured with the Xml plugin.
+// With `embed: true` the plugin extends Jsonic's own grammar so a literal
+// XML element can appear anywhere a Jsonic value is expected. These tests
+// exercise that integration: plain Jsonic documents still parse, a lone
+// XML literal parses as an element, XML literals inside maps and lists
+// parse in place, text with JSON-syntax characters (commas, colons) is
+// preserved, and namespaces resolve across the embedded tree.
 
-func TestXmlEmbeddedInJsonic(t *testing.T) {
-	// An ordinary Jsonic document. Uses backtick-delimited multiline
-	// strings so the XML can embed newlines and double quotes verbatim.
-	jsonicSrc := "{\n" +
-		"  title: 'order-42',\n" +
-		"  payload: `" +
-		`<?xml version="1.0"?>` + "\n" +
-		`<order id="42">` + "\n" +
-		`  <item qty="2">Widget</item>` + "\n" +
-		`  <item qty="1">Gadget</item>` + "\n" +
-		`</order>` + "`,\n" +
-		"}\n"
+func embedParser(t *testing.T) *jsonic.Jsonic {
+	t.Helper()
+	j := jsonic.Make()
+	if err := j.UseDefaults(Xml, Defaults, map[string]any{"embed": true}); err != nil {
+		t.Fatalf("UseDefaults: %v", err)
+	}
+	return j
+}
 
-	outer, err := jsonic.Parse(jsonicSrc)
+func TestEmbedPlainJsonicStillWorks(t *testing.T) {
+	j := embedParser(t)
+	got, err := j.Parse(`{a:1, b:"two"}`)
 	if err != nil {
-		t.Fatalf("parse outer Jsonic: %v", err)
+		t.Fatalf("parse: %v", err)
 	}
-	m, ok := outer.(map[string]any)
+	m, ok := got.(map[string]any)
 	if !ok {
-		t.Fatalf("outer should be map, got %T", outer)
+		t.Fatalf("expected map, got %T", got)
 	}
-	if m["title"] != "order-42" {
-		t.Fatalf("title mismatch: %v", m["title"])
+	if m["a"] != float64(1) || m["b"] != "two" {
+		t.Fatalf("plain jsonic: got %v", m)
 	}
-	payload, ok := m["payload"].(string)
-	if !ok {
-		t.Fatalf("payload should be string, got %T", m["payload"])
-	}
+}
 
-	// Parse the XML payload with the Xml plugin.
-	xmlParser := jsonic.Make()
-	if err := xmlParser.UseDefaults(Xml, Defaults); err != nil {
-		t.Fatalf("xml plugin init: %v", err)
-	}
-	parsed, err := xmlParser.Parse(payload)
+func TestEmbedXmlAsTopLevelValue(t *testing.T) {
+	j := embedParser(t)
+	got, err := j.Parse(`<a>hello</a>`)
 	if err != nil {
-		t.Fatalf("parse XML payload: %v", err)
+		t.Fatalf("parse: %v", err)
 	}
-	el, ok := parsed.(map[string]any)
+	el, ok := got.(map[string]any)
 	if !ok {
-		t.Fatalf("xml result should be map, got %T", parsed)
+		t.Fatalf("expected map, got %T", got)
 	}
-	if el["name"] != "order" {
-		t.Fatalf("root name: got %v, want order", el["name"])
+	if el["name"] != "a" {
+		t.Fatalf("name: got %v", el["name"])
 	}
-	attrs, _ := el["attributes"].(map[string]any)
-	if attrs["id"] != "42" {
-		t.Fatalf("root attr id: got %v, want 42", attrs["id"])
-	}
-	// Count <item> children and check attrs.
 	children, _ := el["children"].([]any)
+	if len(children) != 1 || children[0] != "hello" {
+		t.Fatalf("children: got %v", children)
+	}
+}
+
+func TestEmbedXmlInsideJsonicMap(t *testing.T) {
+	j := embedParser(t)
+	src := `{
+  title: "order-42",
+  payload: <order id="42">
+    <item qty="2">Widget</item>
+    <item qty="1">Gadget</item>
+  </order>,
+}`
+	got, err := j.Parse(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	m := got.(map[string]any)
+	if m["title"] != "order-42" {
+		t.Fatalf("title: got %v", m["title"])
+	}
+	payload := m["payload"].(map[string]any)
+	if payload["name"] != "order" {
+		t.Fatalf("payload.name: got %v", payload["name"])
+	}
+	if a, _ := payload["attributes"].(map[string]any); a["id"] != "42" {
+		t.Fatalf("payload.attributes.id: got %v", a["id"])
+	}
+	children, _ := payload["children"].([]any)
 	var items []map[string]any
 	for _, c := range children {
 		if cm, ok := c.(map[string]any); ok && cm["name"] == "item" {
@@ -265,10 +285,75 @@ func TestXmlEmbeddedInJsonic(t *testing.T) {
 		t.Fatalf("expected 2 item elements, got %d", len(items))
 	}
 	if a, _ := items[0]["attributes"].(map[string]any); a["qty"] != "2" {
-		t.Fatalf("item[0].qty: got %v, want 2", a["qty"])
+		t.Fatalf("item[0].qty: got %v", a["qty"])
+	}
+	if ch, _ := items[0]["children"].([]any); len(ch) != 1 || ch[0] != "Widget" {
+		t.Fatalf("item[0].children: got %v", ch)
 	}
 	if a, _ := items[1]["attributes"].(map[string]any); a["qty"] != "1" {
-		t.Fatalf("item[1].qty: got %v, want 1", a["qty"])
+		t.Fatalf("item[1].qty: got %v", a["qty"])
+	}
+}
+
+func TestEmbedXmlTextPreservesJsonSyntaxChars(t *testing.T) {
+	j := embedParser(t)
+	got, err := j.Parse(`<a>Hello, World!</a>`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	children, _ := got.(map[string]any)["children"].([]any)
+	if len(children) != 1 || children[0] != "Hello, World!" {
+		t.Fatalf("children: got %v", children)
+	}
+
+	got2, err := j.Parse(`<a>key: value</a>`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	children2, _ := got2.(map[string]any)["children"].([]any)
+	if len(children2) != 1 || children2[0] != "key: value" {
+		t.Fatalf("children2: got %v", children2)
+	}
+}
+
+func TestEmbedMultipleXmlInsideJsonicList(t *testing.T) {
+	j := embedParser(t)
+	got, err := j.Parse(`[<a/>, <b>x</b>, <c x="1"/>]`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	arr, ok := got.([]any)
+	if !ok || len(arr) != 3 {
+		t.Fatalf("expected 3-element list, got %v", got)
+	}
+	if arr[0].(map[string]any)["name"] != "a" {
+		t.Fatalf("arr[0]: %v", arr[0])
+	}
+	if ch, _ := arr[1].(map[string]any)["children"].([]any); len(ch) != 1 || ch[0] != "x" {
+		t.Fatalf("arr[1].children: %v", ch)
+	}
+	if a, _ := arr[2].(map[string]any)["attributes"].(map[string]any); a["x"] != "1" {
+		t.Fatalf("arr[2].attributes.x: %v", a)
+	}
+}
+
+func TestEmbedXmlNamespacesResolve(t *testing.T) {
+	j := embedParser(t)
+	got, err := j.Parse(`{doc: <root xmlns="http://e.example"><child/></root>}`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	doc := got.(map[string]any)["doc"].(map[string]any)
+	if doc["namespace"] != "http://e.example" {
+		t.Fatalf("doc.namespace: %v", doc["namespace"])
+	}
+	children, _ := doc["children"].([]any)
+	if len(children) != 1 {
+		t.Fatalf("expected 1 child, got %d", len(children))
+	}
+	child := children[0].(map[string]any)
+	if child["namespace"] != "http://e.example" {
+		t.Fatalf("child.namespace: %v", child["namespace"])
 	}
 }
 

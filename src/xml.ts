@@ -4,6 +4,7 @@
 import {
   Jsonic,
   Rule,
+  RuleSpec,
   Plugin,
   Context,
   Config,
@@ -39,6 +40,16 @@ type XmlOptions = {
   entities: boolean
   // Additional named entities to recognise beyond the five predefined ones.
   customEntities: Record<string, string>
+  // Embed mode. When `false` (default), the plugin configures the parser
+  // for pure-XML input: the start rule becomes `xml`, JSON structural
+  // tokens are disabled, and all non-XML lexing is turned off.
+  //
+  // When `true`, the plugin leaves Jsonic's JSON/JSONIC rules in place
+  // and adds an alternate to the `val` rule so that a literal XML
+  // element (`<tag>…</tag>` or `<tag/>`) appears wherever Jsonic
+  // expects a value. The XML literal is parsed with the same element
+  // grammar used in pure mode.
+  embed: boolean
 }
 
 // --- BEGIN EMBEDDED xml-grammar.jsonic ---
@@ -95,65 +106,70 @@ const grammarText = `
 
 
 const Xml: Plugin = (jsonic: Jsonic, options: XmlOptions) => {
+  const embed = options.embed === true
   const decodeEntity = buildEntityDecoder(options)
 
-  // Register custom lexer matchers.
-  //
-  // The XML tag matcher handles any `<...>` construct: elements (open,
-  // close, self-closing) with attributes, comments, CDATA, processing
-  // instructions and DOCTYPE declarations.
-  //
-  // A text modifier decodes entity references (`&amp;` etc.) in text
-  // nodes. Attribute values are decoded inside the tag matcher.
+  // Register custom lexer matcher. The same matcher is used in both
+  // modes; in embed mode it additionally consumes text between tags so
+  // Jsonic's own text/fixed lexers don't split it on `,` `:` etc.
   jsonic.options({
     lex: {
       match: {
-        xmltag: { order: 1e5, make: buildXmlTagMatcher(decodeEntity) },
+        xmltag: {
+          order: 1e5,
+          make: buildXmlTagMatcher(decodeEntity, embed, options),
+        },
       },
       emptyResult: undefined,
     },
-    // Terminate text at `<` so tag starts are not absorbed into text runs.
+    // Terminate Jsonic text at `<` so XML tag starts are not absorbed
+    // into Jsonic text runs.
     ender: ['<'],
-    rule: {
-      start: 'xml',
-      // Strip out JSON rules so XML input is not reinterpreted.
-      exclude: 'jsonic,imp',
-    },
-    // Disable JSON structural fixed tokens.
-    fixed: {
-      token: {
-        '#OB': null,
-        '#CB': null,
-        '#OS': null,
-        '#CS': null,
-        '#CL': null,
-        '#CA': null,
+  })
+
+  if (!embed) {
+    // Pure XML mode: reconfigure the parser so Jsonic's own value
+    // grammar is unreachable and all lexers other than our tag matcher
+    // are quiescent.
+    jsonic.options({
+      rule: {
+        start: 'xml',
+        exclude: 'jsonic,imp',
       },
-    },
-    // Comments and processing instructions are emitted as a dedicated
-    // #XIG token and skipped by the parser via the IGNORE set. Keep the
-    // default IGNORE members so that whichever lexers happen to produce
-    // #SP/#LN/#CM still get skipped.
-    tokenSet: {
-      IGNORE: ['#SP', '#LN', '#CM', '#XIG'],
-    },
-    // Disable number, value, and string lexing so XML text content is
-    // always a plain string.
-    number: { lex: false },
-    value: { lex: false },
-    string: { lex: false },
-    comment: { lex: false },
-    // Treat whitespace and newlines as part of text content rather than
-    // as separate tokens so text between tags is preserved verbatim.
-    space: { lex: false },
-    line: { lex: false },
-    // Decode entity references in text nodes.
-    text: {
-      modify: (val: any) =>
-        'string' === typeof val && options.entities !== false
-          ? decodeEntity(val)
-          : val,
-    },
+      fixed: {
+        token: {
+          '#OB': null, '#CB': null, '#OS': null, '#CS': null,
+          '#CL': null, '#CA': null,
+        },
+      },
+      tokenSet: {
+        IGNORE: ['#SP', '#LN', '#CM', '#XIG'],
+      },
+      number:  { lex: false },
+      value:   { lex: false },
+      string:  { lex: false },
+      comment: { lex: false },
+      space:   { lex: false },
+      line:    { lex: false },
+      text: {
+        modify: (val: any) =>
+          'string' === typeof val && options.entities !== false
+            ? decodeEntity(val)
+            : val,
+      },
+    })
+  } else {
+    // Embed mode: keep all of Jsonic's standard grammar. Still register
+    // #XIG for comments/PIs/DOCTYPE and add it to IGNORE.
+    jsonic.options({
+      tokenSet: {
+        IGNORE: ['#SP', '#LN', '#CM', '#XIG'],
+      },
+    })
+  }
+
+  // Error templates and hints are installed in both modes.
+  jsonic.options({
     error: {
       xml_mismatched_tag:
         'closing tag </$fsrc> does not match opening tag <$openname>',
@@ -169,11 +185,6 @@ Expected </$openname> but found </$fsrc>.`,
   })
 
   const refs: Record<string, Function> = {
-    // Propagate the parsed root element up to the xml rule so it becomes
-    // the final parse result. The xml rule uses `r: xml` to skip leading
-    // and trailing whitespace text, which creates a chain of rule
-    // instances. The root is the first one; walk the rule chain back to
-    // it so the final result is stored on the root rule's node.
     '@xml-bc': (r: Rule, ctx: Context) => {
       if (r.child && r.child.node) {
         const root = ctx.root()
@@ -184,9 +195,6 @@ Expected </$openname> but found </$fsrc>.`,
       }
     },
 
-    // Initialise the element node when the opening tag `<name ...>` is
-    // matched. The tag token's value carries both the name and the
-    // parsed attribute map.
     '@element-open': (r: Rule) => {
       const v = r.o0.val
       r.node = {
@@ -197,7 +205,6 @@ Expected </$openname> but found </$fsrc>.`,
       }
     },
 
-    // Self-closing tag `<name .../>` - no children.
     '@element-selfclose': (r: Rule) => {
       const v = r.o0.val
       r.node = {
@@ -208,7 +215,6 @@ Expected </$openname> but found </$fsrc>.`,
       }
     },
 
-    // Verify that `</name>` matches the opening `<name ...>`.
     '@element-close': (r: Rule, ctx: Context) => {
       const openName = r.node && r.node.name
       const closeName = r.c0.val
@@ -218,34 +224,57 @@ Expected </$openname> but found </$fsrc>.`,
       }
     },
 
-    // Text node - push the text value onto the enclosing element's
-    // children array. The content/child rules inherit `r.node` from the
-    // parent element, so `r.node.children` is the enclosing element's
-    // child list.
     '@child-text': (r: Rule) => {
       r.node.children.push(r.o0.val)
       r.u.done = true
     },
 
-    // After the child rule returns (either from a text match above or
-    // from a nested `element` push), copy the nested element node into
-    // the parent element's children. Text was already pushed in open.
     '@child-bc': (r: Rule) => {
       if (true !== r.u.done && r.child && r.child.node) {
         r.node.children.push(r.child.node)
       }
     },
 
-    // Condition: close of element is trivially met when it was a
-    // self-closing tag (`<name/>`) with no separate close tag to match.
     '@element-is-selfclosed': (r: Rule) => true === !!r.u.selfclose,
   }
 
-  // Parse embedded grammar definition using a separate standard Jsonic
-  // instance, then wire refs and apply.
+  // Parse embedded grammar definition and wire refs.
   const grammarDef = Jsonic.make()(grammarText)
   grammarDef.ref = refs
   jsonic.grammar(grammarDef)
+
+  if (embed) {
+    // Splice XML literals into the Jsonic `val` rule. When the parser
+    // is looking for a value and sees an `#XOP` or `#XSC` token, it
+    // pushes the `element` rule which builds the XML subtree. Backtrack
+    // by 1 so `element.open` can read the same token and dispatch to
+    // the correct branch.
+    const XOP = jsonic.token('#XOP')
+    const XSC = jsonic.token('#XSC')
+    jsonic.rule('val', (rs: RuleSpec) => {
+      return rs.open(
+        [
+          { s: [XOP], b: 1, p: 'element', g: 'xml' },
+          { s: [XSC], b: 1, p: 'element', g: 'xml' },
+        ],
+      )
+    })
+
+    // In embed mode the top-level wrapper is Jsonic's `val` rule, so
+    // the `@xml-bc` hook that copies the root element to `ctx.root().node`
+    // is not invoked. Resolve namespaces after the full tree lands on
+    // the element rule by hooking its close-state action.
+    if (options.namespaces !== false) {
+      jsonic.rule('element', (rs: RuleSpec) => {
+        rs.bc((r: Rule) => {
+          if (r.node && 'object' === typeof r.node && r.parent &&
+              r.parent.name === 'val') {
+            resolveNamespaces(r.node, {})
+          }
+        })
+      })
+    }
+  }
 }
 
 
@@ -258,9 +287,6 @@ const predefinedEntities: Record<string, string> = {
   apos: "'",
 }
 
-// Build an entity-decoding function. Decodes the five predefined
-// entities, numeric character references (`&#NN;` decimal and `&#xNN;`
-// hex), plus any user-supplied custom entities.
 function buildEntityDecoder(options: XmlOptions) {
   const entities = {
     ...predefinedEntities,
@@ -290,7 +316,12 @@ function buildEntityDecoder(options: XmlOptions) {
 
 
 // Build a lexer matcher that recognises all top-level XML constructs
-// starting with `<`:
+// starting with `<`. In embed mode the matcher also claims any text
+// between an open tag and its matching close tag so that Jsonic's own
+// text/fixed matchers don't split XML character data on JSON-syntax
+// characters (`,`, `:`, etc.).
+//
+// Emits one of:
 //   <name attr="v" ...>     -> #XOP  val = { name, attributes }
 //   <name attr="v" ... />   -> #XSC  val = { name, attributes }
 //   </name>                 -> #XCL  val = name
@@ -300,18 +331,41 @@ function buildEntityDecoder(options: XmlOptions) {
 //   <![CDATA[ ... ]]>       -> #TX   (verbatim text, no entity decoding)
 function buildXmlTagMatcher(
   decodeEntity: (src: string) => string,
+  embed: boolean,
+  options: XmlOptions,
 ) {
   const isNameStart = (ch: string) =>
     /[A-Za-z_:]/.test(ch)
   const isNameChar = (ch: string) =>
     /[A-Za-z0-9_\-\.:]/.test(ch)
-  const isSpace = (ch: string) => ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r'
+  const isSpace = (ch: string) =>
+    ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r'
 
   return function makeXmlTagMatcher(_cfg: Config, _opts: Options) {
     return function xmlTagMatcher(lex: Lex) {
       const { pnt, src } = lex
       const sI = pnt.sI
-      if (src[sI] !== '<') return undefined
+
+      // Embed mode: inside an open XML element (depth > 0), consume
+      // characters up to the next `<` as a single #TX text token so
+      // that Jsonic's own matchers don't reinterpret commas/colons/etc
+      // as JSON separators.
+      if (embed && sI < src.length && src[sI] !== '<') {
+        const depth = (lex.ctx?.u?.xmlDepth | 0) || 0
+        if (depth > 0) {
+          let i = sI
+          while (i < src.length && src[i] !== '<') i++
+          if (i === sI) return undefined
+          const raw = src.substring(sI, i)
+          const val = options.entities !== false ? decodeEntity(raw) : raw
+          const tkn = lex.token('#TX', val, raw, pnt)
+          pnt.sI = i
+          pnt.cI += i - sI
+          return tkn
+        }
+      }
+
+      if (sI >= src.length || src[sI] !== '<') return undefined
 
       // Comment: <!-- ... -->
       if (src.startsWith('<!--', sI)) {
@@ -340,7 +394,7 @@ function buildXmlTagMatcher(
         return tkn
       }
 
-      // DOCTYPE: <!DOCTYPE ... [possibly with [...] subset ]>
+      // DOCTYPE: <!DOCTYPE ... [...] >
       if (src.startsWith('<!DOCTYPE', sI)) {
         let i = sI + 9
         let depth = 0
@@ -361,7 +415,7 @@ function buildXmlTagMatcher(
         return tkn
       }
 
-      // Processing instruction: <? ... ?>  (including <?xml ...?> decl)
+      // Processing instruction: <? ... ?>
       if (src[sI + 1] === '?') {
         const endIdx = src.indexOf('?>', sI + 2)
         if (endIdx === -1) {
@@ -390,6 +444,10 @@ function buildXmlTagMatcher(
         const tkn = lex.token('#XCL', name, src.substring(sI, end), pnt)
         pnt.sI = end
         pnt.cI += end - sI
+        if (embed && lex.ctx) {
+          const u: any = lex.ctx.u || (lex.ctx.u = {})
+          u.xmlDepth = Math.max(0, (u.xmlDepth | 0) - 1)
+        }
         return tkn
       }
 
@@ -402,21 +460,22 @@ function buildXmlTagMatcher(
       const name = src.substring(nameStart, i)
       const attributes: Record<string, string> = {}
 
-      // Parse zero or more attributes.
       while (true) {
         const wsStart = i
         while (i < src.length && isSpace(src[i])) i++
-
         if (i >= src.length) {
           return lex.bad('xml_invalid_tag', sI, src.length)
         }
 
-        // End of tag.
         if (src[i] === '>') {
           const end = i + 1
           const tkn = lex.token('#XOP', { name, attributes }, src.substring(sI, end), pnt)
           pnt.sI = end
           pnt.cI += end - sI
+          if (embed && lex.ctx) {
+            const u: any = lex.ctx.u || (lex.ctx.u = {})
+            u.xmlDepth = (u.xmlDepth | 0) + 1
+          }
           return tkn
         }
         if (src[i] === '/' && src[i + 1] === '>') {
@@ -424,19 +483,18 @@ function buildXmlTagMatcher(
           const tkn = lex.token('#XSC', { name, attributes }, src.substring(sI, end), pnt)
           pnt.sI = end
           pnt.cI += end - sI
+          // #XSC is an instantly-closed element, so depth is unchanged.
           return tkn
         }
 
-        // An attribute must follow, preceded by whitespace.
         if (wsStart === i) {
           return lex.bad('xml_invalid_tag', sI, i + 1)
         }
 
-        // Attribute name.
-        const attrStart = i
         if (!isNameStart(src[i])) {
           return lex.bad('xml_invalid_tag', sI, i + 1)
         }
+        const attrStart = i
         i++
         while (i < src.length && isNameChar(src[i])) i++
         const attrName = src.substring(attrStart, i)
@@ -459,7 +517,7 @@ function buildXmlTagMatcher(
           return lex.bad('xml_invalid_tag', sI, src.length)
         }
         const rawVal = src.substring(valStart, i)
-        i++ // consume closing quote
+        i++
 
         attributes[attrName] = decodeEntity(rawVal)
       }
@@ -469,16 +527,14 @@ function buildXmlTagMatcher(
 
 
 // Resolve namespaces on an element tree. Walks the tree maintaining a
-// scope map of `prefix` -> `namespace URI`. The empty string key is the
-// default namespace. Mutates each element to add `prefix`, `localName`
-// and `namespace` where applicable.
+// scope map of `prefix` -> `namespace URI`. The empty-string key holds
+// the default namespace.
 function resolveNamespaces(
   element: XmlElement,
   scope: Record<string, string>,
 ) {
   const localScope: Record<string, string> = { ...scope }
 
-  // Apply xmlns bindings from this element's attributes.
   for (const key of Object.keys(element.attributes || {})) {
     const val = element.attributes[key]
     if (key === 'xmlns') {
@@ -515,6 +571,7 @@ Xml.defaults = {
   namespaces: true,
   entities: true,
   customEntities: {},
+  embed: false,
 } as XmlOptions
 
 export { Xml }

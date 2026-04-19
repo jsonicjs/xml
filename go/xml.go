@@ -27,10 +27,28 @@ const Version = "0.1.0"
 
 // Defaults are merged with caller-supplied options when the plugin is
 // registered via jsonic.UseDefaults.
+//
+// Option keys:
+//
+//	namespaces     bool              resolve xmlns / xmlns:* into prefix /
+//	                                 localName / namespace fields on every
+//	                                 element. Default: true.
+//	entities       bool              decode the five predefined entities and
+//	                                 numeric character references in text and
+//	                                 attribute values. Default: true.
+//	customEntities map[string]string extra named entities to recognise.
+//	embed          bool              when true, keep Jsonic's JSON/JSONIC
+//	                                 grammar in place and splice an XML
+//	                                 literal alternate into the `val` rule
+//	                                 so `<tag>…</tag>` can appear wherever
+//	                                 Jsonic expects a value. When false
+//	                                 (default) the parser is reconfigured
+//	                                 as a pure-XML parser.
 var Defaults = map[string]any{
 	"namespaces":     true,
 	"entities":       true,
 	"customEntities": map[string]string{},
+	"embed":          false,
 }
 
 // Xml is the Jsonic plugin entry point. Register via:
@@ -48,6 +66,7 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 	namespacesOn := toBool(options["namespaces"], true)
 	entitiesOn := toBool(options["entities"], true)
 	customEntities := toStringMap(options["customEntities"])
+	embed := toBool(options["embed"], false)
 
 	decode := buildEntityDecoder(entitiesOn, customEntities)
 
@@ -59,48 +78,29 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 	xclTin := j.Token("#XCL", "")
 	xscTin := j.Token("#XSC", "")
 
-	// Register a dummy fixed token bound to a character that cannot
-	// legally appear in XML source (ASCII SOH). This keeps the lexer's
-	// internal `FixedSorted` list non-empty, which in turn disables an
-	// otherwise-hardcoded fallback that still ends text tokens on any
-	// of `{ } [ ] : ,` even when those symbols have been removed from
-	// the fixed token map. Without this, XML text content containing a
-	// comma would be truncated at the comma.
-	soh := "\x01"
-	_ = j.Token("#XDUM", soh)
+	if !embed {
+		// Register a dummy fixed token bound to a character that cannot
+		// legally appear in XML source (ASCII SOH). This keeps the
+		// lexer's internal `FixedSorted` list non-empty, which in turn
+		// disables an otherwise-hardcoded fallback that still ends text
+		// tokens on `{ } [ ] : ,` even when those symbols have been
+		// removed from the fixed token map. Without this, XML text
+		// content containing a comma would be truncated at the comma.
+		// In embed mode the JSON structural tokens remain in place, so
+		// the dummy is not needed.
+		soh := "\x01"
+		_ = j.Token("#XDUM", soh)
+	}
 
-	// Custom lexer matcher registered at low priority so it runs before
-	// the built-in text/fixed matchers and captures every `<...>`
-	// construct as a single token.
+	// Shared options installed in both modes: the custom matcher, the
+	// text-end character `<`, and the XML-specific error templates.
 	j.SetOptions(jsonic.Options{
 		Lex: &jsonic.LexOptions{
 			Match: map[string]*jsonic.MatchSpec{
-				"xmltag": {Order: 100_000, Make: buildXmlTagMatcher(decode, xigTin, xopTin, xclTin, xscTin)},
+				"xmltag": {Order: 100_000, Make: buildXmlTagMatcher(decode, entitiesOn, embed, xigTin, xopTin, xclTin, xscTin)},
 			},
 		},
 		Ender: []string{"<"},
-		Rule: &jsonic.RuleOptions{
-			Start:   "xml",
-			Exclude: "jsonic,imp",
-		},
-		Fixed: &jsonic.FixedOptions{Token: map[string]*string{
-			"#OB": nil, "#CB": nil, "#OS": nil, "#CS": nil,
-			"#CL": nil, "#CA": nil,
-		}},
-		Number:  &jsonic.NumberOptions{Lex: boolPtr(false)},
-		Value:   &jsonic.ValueOptions{Lex: boolPtr(false)},
-		String:  &jsonic.StringOptions{Lex: boolPtr(false)},
-		Comment: &jsonic.CommentOptions{Lex: boolPtr(false)},
-		Space:   &jsonic.SpaceOptions{Lex: boolPtr(false)},
-		Line:    &jsonic.LineOptions{Lex: boolPtr(false)},
-		Text: &jsonic.TextOptions{
-			Modify: []jsonic.ValModifier{func(v any) any {
-				if s, ok := v.(string); ok && entitiesOn {
-					return decode(s)
-				}
-				return v
-			}},
-		},
 		Error: map[string]string{
 			"xml_mismatched_tag": "closing tag </$fsrc> does not match opening tag <$openname>",
 			"xml_invalid_tag":    "invalid tag: $fsrc",
@@ -113,8 +113,41 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 		},
 	})
 
+	if !embed {
+		// Pure XML mode: reconfigure the parser so Jsonic's own value
+		// grammar is unreachable and all lexers other than our tag
+		// matcher are quiescent.
+		j.SetOptions(jsonic.Options{
+			Rule: &jsonic.RuleOptions{
+				Start:   "xml",
+				Exclude: "jsonic,imp",
+			},
+			Fixed: &jsonic.FixedOptions{Token: map[string]*string{
+				"#OB": nil, "#CB": nil, "#OS": nil, "#CS": nil,
+				"#CL": nil, "#CA": nil,
+			}},
+			Number:  &jsonic.NumberOptions{Lex: boolPtr(false)},
+			Value:   &jsonic.ValueOptions{Lex: boolPtr(false)},
+			String:  &jsonic.StringOptions{Lex: boolPtr(false)},
+			Comment: &jsonic.CommentOptions{Lex: boolPtr(false)},
+			Space:   &jsonic.SpaceOptions{Lex: boolPtr(false)},
+			Line:    &jsonic.LineOptions{Lex: boolPtr(false)},
+			Text: &jsonic.TextOptions{
+				Modify: []jsonic.ValModifier{func(v any) any {
+					if s, ok := v.(string); ok && entitiesOn {
+						return decode(s)
+					}
+					return v
+				}},
+			},
+		})
+	}
+
 	// IGNORE set: drop #XIG (comments, PIs, DOCTYPE) along with the
-	// default members so any of them is skipped by the parser.
+	// default members so any of them is skipped by the parser. In
+	// embed mode this preserves all default ignored tokens; in pure
+	// mode the SP/LN/CM tokens are never produced (we disabled their
+	// lexers), but keeping them here is harmless.
 	j.SetTokenSet("IGNORE", []jsonic.Tin{
 		j.Token("#SP", ""), j.Token("#LN", ""), j.Token("#CM", ""), xigTin,
 	})
@@ -259,7 +292,71 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 		return fmt.Errorf("xml: apply grammar: %w", err)
 	}
 
+	if embed {
+		// Splice XML literals into the Jsonic `val` rule. When the
+		// parser is looking for a value and sees `#XOP` or `#XSC`,
+		// push the `element` rule (backtracking by 1 so element.open
+		// can read the same token and dispatch).
+		j.Rule("val", func(rs *jsonic.RuleSpec) {
+			rs.Open = append(rs.Open,
+				&jsonic.AltSpec{
+					S: [][]jsonic.Tin{{xopTin}},
+					B: 1, P: "element", G: "xml",
+				},
+				&jsonic.AltSpec{
+					S: [][]jsonic.Tin{{xscTin}},
+					B: 1, P: "element", G: "xml",
+				},
+			)
+		})
+
+		// In embed mode the top-level wrapper is Jsonic's `val` rule,
+		// so the @xml-bc hook that copies the root element to
+		// ctx.root().node is not invoked. Resolve namespaces instead
+		// when the element rule closes directly under a val rule.
+		if namespacesOn {
+			j.Rule("element", func(rs *jsonic.RuleSpec) {
+				rs.AddBC(func(r *jsonic.Rule, ctx *jsonic.Context) {
+					if r.Parent != nil && r.Parent != jsonic.NoRule &&
+						r.Parent.Name == "val" {
+						if el, ok := r.Node.(map[string]any); ok {
+							resolveNamespaces(el, nil)
+						}
+					}
+				})
+			})
+		}
+	}
+
 	return nil
+}
+
+// xmlDepth reads the per-parse XML nesting counter from the lex context.
+// Returns 0 if not set.
+func xmlDepth(lex *jsonic.Lex) int {
+	if lex == nil || lex.Ctx == nil {
+		return 0
+	}
+	if lex.Ctx.U == nil {
+		lex.Ctx.U = map[string]any{}
+		return 0
+	}
+	v, _ := lex.Ctx.U["xmlDepth"].(int)
+	return v
+}
+
+// setXmlDepth writes the XML nesting counter, clamping at zero.
+func setXmlDepth(lex *jsonic.Lex, d int) {
+	if lex == nil || lex.Ctx == nil {
+		return
+	}
+	if lex.Ctx.U == nil {
+		lex.Ctx.U = map[string]any{}
+	}
+	if d < 0 {
+		d = 0
+	}
+	lex.Ctx.U["xmlDepth"] = d
 }
 
 // firstRule walks back through Prev links to find the originating rule
@@ -341,6 +438,8 @@ func buildEntityDecoder(enabled bool, custom map[string]string) func(string) str
 //	#TX   <![CDATA[ ... ]]>        val = cdata body (verbatim, no entity decoding)
 func buildXmlTagMatcher(
 	decode func(string) string,
+	entitiesOn bool,
+	embed bool,
 	xigTin, xopTin, xclTin, xscTin jsonic.Tin,
 ) jsonic.MakeLexMatcher {
 	return func(_ *jsonic.LexConfig, _ *jsonic.Options) jsonic.LexMatcher {
@@ -349,6 +448,31 @@ func buildXmlTagMatcher(
 			src := lex.Src
 			srclen := len(src)
 			sI := pnt.SI
+
+			// Embed mode: inside an open XML element (depth > 0),
+			// consume characters up to the next `<` as a single #TX
+			// text token so that Jsonic's own matchers don't reinterpret
+			// commas/colons/etc. as JSON separators.
+			if embed && sI < srclen && src[sI] != '<' {
+				if depth := xmlDepth(lex); depth > 0 {
+					i := sI
+					for i < srclen && src[i] != '<' {
+						i++
+					}
+					if i == sI {
+						return nil
+					}
+					raw := src[sI:i]
+					var val any = raw
+					if entitiesOn {
+						val = decode(raw)
+					}
+					tkn := lex.Token("#TX", jsonic.TinTX, val, raw)
+					advance(pnt, sI, i)
+					return tkn
+				}
+			}
+
 			if sI >= srclen || src[sI] != '<' {
 				return nil
 			}
@@ -441,6 +565,9 @@ func buildXmlTagMatcher(
 				tsrc := src[sI:finish]
 				tkn := lex.Token("#XCL", xclTin, name, tsrc)
 				advance(pnt, sI, finish)
+				if embed {
+					setXmlDepth(lex, xmlDepth(lex)-1)
+				}
 				return tkn
 			}
 
@@ -473,6 +600,9 @@ func buildXmlTagMatcher(
 					val := map[string]any{"name": name, "attributes": attrs}
 					tkn := lex.Token("#XOP", xopTin, val, tsrc)
 					advance(pnt, sI, finish)
+					if embed {
+						setXmlDepth(lex, xmlDepth(lex)+1)
+					}
 					return tkn
 				}
 				if src[i] == '/' && i+1 < srclen && src[i+1] == '>' {
@@ -481,6 +611,7 @@ func buildXmlTagMatcher(
 					val := map[string]any{"name": name, "attributes": attrs}
 					tkn := lex.Token("#XSC", xscTin, val, tsrc)
 					advance(pnt, sI, finish)
+					// #XSC is an instantly-closed element; depth unchanged.
 					return tkn
 				}
 

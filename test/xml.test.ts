@@ -2,7 +2,7 @@
 
 import { describe, test } from 'node:test'
 import assert from 'node:assert'
-import { readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { Jsonic } from 'jsonic'
@@ -125,36 +125,51 @@ for (const file of readdirSync(specDir)) {
 // ---------------------------------------------------------------------------
 // XML embedded in Jsonic source
 //
-// A common real-world pattern is to keep XML payloads inside a larger
-// Jsonic configuration file as a string value. This test demonstrates
-// that the stock Jsonic parser reads the outer document and the Xml
-// plugin parses the embedded payload.
+// With `embed: true` the plugin extends Jsonic's own grammar so a literal
+// XML element can appear anywhere a Jsonic value is expected. The outer
+// document is parsed by standard Jsonic; the XML subtree is built by the
+// plugin's element grammar.
 // ---------------------------------------------------------------------------
 
 describe('xml-embedded-in-jsonic', () => {
-  test('parses XML inside a Jsonic multiline string', () => {
-    // A plain Jsonic document. The backtick string carries the XML
-    // payload verbatim, with newlines and double quotes intact.
-    const jsonicSrc = "{\n" +
-      "  title: 'order-42',\n" +
-      "  payload: `" +
-      '<?xml version="1.0"?>\n' +
-      '<order id="42">\n' +
-      '  <item qty="2">Widget</item>\n' +
-      '  <item qty="1">Gadget</item>\n' +
-      '</order>' + "`,\n" +
-      "}\n"
+  test('plain Jsonic is unaffected by embed mode', () => {
+    const j = Jsonic.make().use(Xml, { embed: true })
+    assert.deepEqual(j('{a:1, b:"two"}'), { a: 1, b: 'two' })
+    assert.deepEqual(j('[1, 2, 3]'), [1, 2, 3])
+  })
 
-    const outer = Jsonic(jsonicSrc) as any
-    assert.equal(outer.title, 'order-42')
-    assert.equal(typeof outer.payload, 'string')
+  test('XML literal as the top-level value', () => {
+    const j = Jsonic.make().use(Xml, { embed: true })
+    assert.deepEqual(j('<a>hello</a>'), {
+      name: 'a',
+      localName: 'a',
+      attributes: {},
+      children: ['hello'],
+    })
+    assert.deepEqual(j('<br/>'), {
+      name: 'br',
+      localName: 'br',
+      attributes: {},
+      children: [],
+    })
+  })
 
-    const xmlParser = Jsonic.make().use(Xml)
-    const parsed = xmlParser(outer.payload) as any
-    assert.equal(parsed.name, 'order')
-    assert.equal(parsed.attributes.id, '42')
-
-    const items = parsed.children.filter(
+  test('XML literal as a value inside a Jsonic map', () => {
+    const j = Jsonic.make().use(Xml, { embed: true })
+    const src =
+      '{\n' +
+      '  title: "order-42",\n' +
+      '  payload: <order id="42">\n' +
+      '    <item qty="2">Widget</item>\n' +
+      '    <item qty="1">Gadget</item>\n' +
+      '  </order>,\n' +
+      '}'
+    const result = j(src) as any
+    assert.equal(result.title, 'order-42')
+    const payload = result.payload
+    assert.equal(payload.name, 'order')
+    assert.equal(payload.attributes.id, '42')
+    const items = payload.children.filter(
       (c: any) => typeof c === 'object' && c.name === 'item',
     )
     assert.equal(items.length, 2)
@@ -162,5 +177,117 @@ describe('xml-embedded-in-jsonic', () => {
     assert.equal(items[0].children[0], 'Widget')
     assert.equal(items[1].attributes.qty, '1')
     assert.equal(items[1].children[0], 'Gadget')
+  })
+
+  test('XML literal preserves comma and colon in text', () => {
+    // Without embed-mode text handling, Jsonic's lexer would split this
+    // text on the comma and reject the fragment. The custom matcher
+    // claims the run when depth > 0, so it arrives as a single child.
+    const j = Jsonic.make().use(Xml, { embed: true })
+    assert.deepEqual(j('<a>Hello, World!</a>'), {
+      name: 'a',
+      localName: 'a',
+      attributes: {},
+      children: ['Hello, World!'],
+    })
+    assert.deepEqual(j('<a>key: value</a>'), {
+      name: 'a',
+      localName: 'a',
+      attributes: {},
+      children: ['key: value'],
+    })
+  })
+
+  test('multiple XML literals inside a Jsonic list', () => {
+    const j = Jsonic.make().use(Xml, { embed: true })
+    const result = j('[<a/>, <b>x</b>, <c x="1"/>]') as any[]
+    assert.equal(result.length, 3)
+    assert.equal(result[0].name, 'a')
+    assert.equal(result[1].name, 'b')
+    assert.deepEqual(result[1].children, ['x'])
+    assert.equal(result[2].attributes.x, '1')
+  })
+
+  test('XML literal with namespaces resolves correctly', () => {
+    const j = Jsonic.make().use(Xml, { embed: true })
+    const result = j(
+      '{doc: <root xmlns="http://e.example"><child/></root>}',
+    ) as any
+    assert.equal(result.doc.namespace, 'http://e.example')
+    assert.equal(result.doc.children[0].namespace, 'http://e.example')
+  })
+})
+
+
+// ---------------------------------------------------------------------------
+// W3C XML Conformance Test Suite (xmltest subset)
+//
+// Exercised when the suite has been fetched to `test/xmlconf/` via
+// `scripts/fetch-xml-suite.sh`. Skipped otherwise. Mirrors the Go test
+// in go/xmlconf_test.go: counts valid/sa documents that parse and
+// not-wf/sa documents that are correctly rejected, requiring each
+// count to stay above a regression floor. Current parser numbers are
+// ~116/120 valid and ~39/186 not-wf rejected.
+// ---------------------------------------------------------------------------
+
+const xmlconfRoot = join(__dirname, '..', 'test', 'xmlconf')
+const xmlconfAvailable = existsSync(join(xmlconfRoot, 'xmltest'))
+
+// Regression guards; raise once parser coverage improves.
+const VALID_SA_PASS_FLOOR = 110
+const NOT_WF_SA_REJECT_FLOOR = 30
+
+function xmlconfFiles(dir: string): string[] {
+  if (!existsSync(dir)) return []
+  return readdirSync(dir)
+    .filter((n) => n.endsWith('.xml'))
+    .filter((n) => statSync(join(dir, n)).isFile())
+    .map((n) => join(dir, n))
+}
+
+describe('w3c-xml-conformance', { skip: !xmlconfAvailable }, () => {
+  test('valid/sa documents parse', () => {
+    const files = xmlconfFiles(join(xmlconfRoot, 'xmltest', 'valid', 'sa'))
+    assert.ok(files.length > 0, 'no valid/sa files')
+    const parser = Jsonic.make().use(Xml)
+    let pass = 0
+    const failures: string[] = []
+    for (const path of files) {
+      const body = readFileSync(path, 'utf8')
+      try {
+        parser(body)
+        pass++
+      } catch (err) {
+        const msg = (err as Error).message.split('\n', 1)[0]
+        failures.push(`${path.split('/').slice(-1)[0]}: ${msg}`)
+      }
+    }
+    console.log(`  valid/sa: ${pass} / ${files.length} parsed successfully`)
+    assert.ok(
+      pass >= VALID_SA_PASS_FLOOR,
+      `valid/sa pass count ${pass} dropped below floor ${VALID_SA_PASS_FLOOR}. Sample failures:\n  ${failures.slice(0, 5).join('\n  ')}`,
+    )
+  })
+
+  test('not-wf/sa documents are rejected', () => {
+    const files = xmlconfFiles(join(xmlconfRoot, 'xmltest', 'not-wf', 'sa'))
+    assert.ok(files.length > 0, 'no not-wf/sa files')
+    const parser = Jsonic.make().use(Xml)
+    let rejected = 0
+    const falseAccepts: string[] = []
+    for (const path of files) {
+      const body = readFileSync(path, 'utf8')
+      try {
+        parser(body)
+        falseAccepts.push(path.split('/').slice(-1)[0])
+      } catch {
+        rejected++
+      }
+    }
+    console.log(`  not-wf/sa: ${rejected} / ${files.length} rejected as expected`)
+    assert.ok(
+      rejected >= NOT_WF_SA_REJECT_FLOOR,
+      `not-wf/sa reject count ${rejected} dropped below floor ${NOT_WF_SA_REJECT_FLOOR}. Sample false accepts:\n  ${falseAccepts.slice(0, 5).join('\n  ')}`,
+    )
   })
 })

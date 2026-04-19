@@ -1,8 +1,6 @@
 lib-cov
 *.seed
 *.log
-*.csv
-!test/fixtures/*.csv
 *.dat
 *.out
 *.pid
@@ -19,7 +17,6 @@ node_modules
 
 .idea/
 
-
 trial
 
 test/coverage.html
@@ -32,4 +29,6 @@ dist-test
 package-lock.json
 yarn.lock
 
-
+# W3C XML Conformance Test Suite (downloaded on demand via
+# scripts/fetch-xml-suite.sh — not redistributed).
+test/xmlconf/
