@@ -40,6 +40,11 @@ const Version = "0.1.0"
 //	                                 numeric character references in text and
 //	                                 attribute values. Default: true.
 //	customEntities map[string]string extra named entities to recognise.
+//	strictEntities bool              enforce XML 1.0 §4.1: every named entity
+//	                                 reference must resolve to a declared
+//	                                 entity. Default: true. When false,
+//	                                 references to unknown names are left
+//	                                 as-is in the output.
 //	embed          bool              when true, keep Jsonic's JSON/JSONIC
 //	                                 grammar in place and splice an XML
 //	                                 literal alternate into the `val` rule
@@ -51,6 +56,7 @@ var Defaults = map[string]any{
 	"namespaces":     true,
 	"entities":       true,
 	"customEntities": map[string]string{},
+	"strictEntities": true,
 	"embed":          false,
 }
 
@@ -69,9 +75,10 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 	namespacesOn := toBool(options["namespaces"], true)
 	entitiesOn := toBool(options["entities"], true)
 	customEntities := toStringMap(options["customEntities"])
+	strictEntities := toBool(options["strictEntities"], true)
 	embed := toBool(options["embed"], false)
 
-	decode := buildEntityDecoder(entitiesOn, customEntities)
+	decode, declared := buildEntityDecoder(entitiesOn, customEntities)
 
 	// Reserve #XIG (ignored) and #XOP/#XCL/#XSC (tag tokens) so they have
 	// stable tins before the grammar references them. The tins are then
@@ -100,7 +107,7 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 	j.SetOptions(jsonic.Options{
 		Lex: &jsonic.LexOptions{
 			Match: map[string]*jsonic.MatchSpec{
-				"xmltag": {Order: 100_000, Make: buildXmlTagMatcher(decode, entitiesOn, embed, xigTin, xopTin, xclTin, xscTin)},
+				"xmltag": {Order: 100_000, Make: buildXmlTagMatcher(decode, declared, entitiesOn, strictEntities, embed, xigTin, xopTin, xclTin, xscTin)},
 			},
 		},
 		Ender: []string{"<"},
@@ -117,6 +124,7 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 			"invalid_xml_char":         "illegal control character in XML data",
 			"reserved_namespace":       "invalid use of a reserved namespace prefix or URI",
 			"unbound_prefix":           "element or attribute uses an undeclared namespace prefix",
+			"undeclared_entity":        "reference to undeclared entity",
 		},
 		Hint: map[string]string{
 			"xml_mismatched_tag":       "Each opening tag must be paired with a matching closing tag.\nExpected </$openname> but found </$fsrc>.",
@@ -131,6 +139,7 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 			"invalid_xml_char":         "Only #x9, #xA, #xD and code points >= #x20 are legal XML characters.",
 			"reserved_namespace":       "The \"xml\" prefix is fixed to " + xmlNSURI + "; the \"xmlns\" prefix cannot be redeclared, and neither URI may be bound to any other prefix or as the default namespace.",
 			"unbound_prefix":           "Declare the prefix with xmlns:prefix=\"...\" on this element or one of its ancestors.",
+			"undeclared_entity":        "Declare the entity in the DOCTYPE internal subset, add it to the customEntities option, or set strictEntities: false to allow unresolved references through.",
 		},
 	})
 
@@ -553,17 +562,21 @@ type EntityDecoder func(s string, dtd map[string]string) string
 // buildEntityDecoder returns a function that decodes the five
 // predefined entities, numeric character references, any
 // caller-supplied custom entities, and per-parse DTD entities.
-// When `enabled` is false the function is an identity.
-func buildEntityDecoder(enabled bool, custom map[string]string) EntityDecoder {
-	if !enabled {
-		return func(s string, _ map[string]string) string { return s }
-	}
+// When `enabled` is false the function is an identity. The second
+// return value is the merged set of always-declared names used for
+// strict-entity validation in the matcher.
+func buildEntityDecoder(
+	enabled bool, custom map[string]string,
+) (EntityDecoder, map[string]string) {
 	base := make(map[string]string, len(predefinedEntities)+len(custom))
 	for k, v := range predefinedEntities {
 		base[k] = v
 	}
 	for k, v := range custom {
 		base[k] = v
+	}
+	if !enabled {
+		return func(s string, _ map[string]string) string { return s }, base
 	}
 	var expand func(s string, dtd map[string]string, seen map[string]bool) string
 	expand = func(s string, dtd map[string]string, seen map[string]bool) string {
@@ -605,7 +618,7 @@ func buildEntityDecoder(enabled bool, custom map[string]string) EntityDecoder {
 	}
 	return func(s string, dtd map[string]string) string {
 		return expand(s, dtd, map[string]bool{})
-	}
+	}, base
 }
 
 // buildXmlTagMatcher returns a MakeLexMatcher that recognises every
@@ -620,7 +633,9 @@ func buildEntityDecoder(enabled bool, custom map[string]string) EntityDecoder {
 //	#TX   <![CDATA[ ... ]]>        val = cdata body (verbatim, no entity decoding)
 func buildXmlTagMatcher(
 	decode EntityDecoder,
+	declared map[string]string,
 	entitiesOn bool,
+	strict bool,
 	embed bool,
 	xigTin, xopTin, xclTin, xscTin jsonic.Tin,
 ) jsonic.MakeLexMatcher {
@@ -659,7 +674,7 @@ func buildXmlTagMatcher(
 					if strings.Contains(raw, "]]>") {
 						return lex.Bad("cdata_terminator_in_text")
 					}
-					if code := checkEntityRefs(raw); code != "" {
+					if code := checkEntityRefs(raw, dtdEntities(lex), declared, strict); code != "" {
 						return lex.Bad(code)
 					}
 					// §2.11 end-of-line normalisation.
@@ -727,6 +742,19 @@ func buildXmlTagMatcher(
 				subsetStart, subsetEnd := -1, -1
 				for i < srclen {
 					ch := src[i]
+					// Skip over quoted strings so `]` and `>` inside an
+					// entity value or attribute default cannot terminate
+					// the subset prematurely.
+					if ch == '"' || ch == '\'' {
+						i++
+						for i < srclen && src[i] != ch {
+							i++
+						}
+						if i < srclen {
+							i++
+						}
+						continue
+					}
 					if ch == '[' {
 						if depth == 0 {
 							subsetStart = i + 1
@@ -906,7 +934,7 @@ func buildXmlTagMatcher(
 				if code := checkChars(raw); code != "" {
 					return lex.Bad(code)
 				}
-				if code := checkEntityRefs(raw); code != "" {
+				if code := checkEntityRefs(raw, dtdEntities(lex), declared, strict); code != "" {
 					return lex.Bad(code)
 				}
 				if _, ok := attrs[attrName]; ok {
@@ -988,14 +1016,19 @@ func checkChars(s string) string {
 
 // checkEntityRefs validates that every `&` in `s` begins a well-formed
 // entity reference. Returns "" on success, otherwise an error code
-// suitable for lex.Bad().
+// suitable for lex.Bad(). The `dtd` map supplies DOCTYPE-declared
+// entity names; `declared` adds names that are always declared
+// (typically the predefined and caller-supplied entities). When
+// `strict` is true, references to unknown names trigger
+// "undeclared_entity"; otherwise the syntactic check still runs but
+// unknown names pass through.
 //
 // Well-formed forms:
 //
 //	&name;     - name must start with a NameStartChar
 //	&#nnnn;    - decimal numeric character reference
 //	&#xhhhh;   - hexadecimal numeric character reference
-func checkEntityRefs(s string) string {
+func checkEntityRefs(s string, dtd, declared map[string]string, strict bool) string {
 	for i := 0; i < len(s); i++ {
 		if s[i] != '&' {
 			continue
@@ -1056,6 +1089,14 @@ func checkEntityRefs(s string) string {
 					return "bad_entity_ref"
 				}
 				j += sz
+			}
+			// §4.1: in strict mode the named entity must resolve.
+			if strict {
+				if _, ok := declared[ref]; !ok {
+					if _, ok := dtd[ref]; !ok {
+						return "undeclared_entity"
+					}
+				}
 			}
 		}
 		i = semi

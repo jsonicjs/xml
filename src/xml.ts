@@ -47,6 +47,12 @@ type XmlOptions = {
   entities: boolean
   // Additional named entities to recognise beyond the five predefined ones.
   customEntities: Record<string, string>
+  // Whether to enforce XML 1.0 §4.1 — every named entity reference must
+  // resolve to a declared entity (predefined, customEntities, or a DOCTYPE
+  // <!ENTITY> declaration). Default: true. When set to false, references
+  // to unknown names are left as-is in the output (legacy behaviour
+  // useful for templating).
+  strictEntities: boolean
   // Embed mode. When `false` (default), the plugin configures the parser
   // for pure-XML input: the start rule becomes `xml`, JSON structural
   // tokens are disabled, and all non-XML lexing is turned off.
@@ -191,6 +197,7 @@ const Xml: Plugin = (jsonic: Jsonic, options: XmlOptions) => {
       invalid_xml_char: 'illegal control character in XML data',
       reserved_namespace: 'invalid use of a reserved namespace prefix or URI',
       unbound_prefix: 'element or attribute uses an undeclared namespace prefix',
+      undeclared_entity: 'reference to undeclared entity',
     },
     hint: {
       xml_mismatched_tag: `Each opening tag must be paired with a matching closing tag.
@@ -206,6 +213,7 @@ Expected </$openname> but found </$fsrc>.`,
       invalid_xml_char: `Only #x9, #xA, #xD and code points >= #x20 are legal XML characters.`,
       reserved_namespace: `The "xml" prefix is fixed to ${XML_NS_URI}; the "xmlns" prefix cannot be redeclared, and neither URI may be bound to any other prefix or as the default namespace.`,
       unbound_prefix: `Declare the prefix with xmlns:prefix="..." on this element or one of its ancestors.`,
+      undeclared_entity: `Declare the entity in the DOCTYPE internal subset, add it to the customEntities option, or set strictEntities: false to allow unresolved references through.`,
     },
   })
 
@@ -502,9 +510,15 @@ function buildEntityDecoder(options: XmlOptions) {
     })
   }
 
-  return function decodeEntities(src: string, dtd?: Record<string, string>): string {
+  const decoder = function decodeEntities(src: string, dtd?: Record<string, string>): string {
     return expand(src, dtd || {}, new Set())
-  }
+  } as DecodeEntitiesFn
+  decoder.declared = baseEntities
+  return decoder
+}
+
+type DecodeEntitiesFn = ((src: string, dtd?: Record<string, string>) => string) & {
+  declared: Record<string, string>
 }
 
 // Parse the body of a DOCTYPE declaration (the text between the `[`
@@ -579,10 +593,12 @@ function parseDoctypeEntities(body: string): Record<string, string> {
 //   <!DOCTYPE ...>          -> #XIG  (parser ignores)
 //   <![CDATA[ ... ]]>       -> #TX   (verbatim text, no entity decoding)
 function buildXmlTagMatcher(
-  decodeEntity: (src: string, dtd?: Record<string, string>) => string,
+  decodeEntity: DecodeEntitiesFn,
   embed: boolean,
   options: XmlOptions,
 ) {
+  const strict = options.strictEntities !== false
+  const declared = decodeEntity.declared
   // Backwards-compatible single-char predicates retained for sites that
   // only need a simple character class check (e.g. peek before reading
   // a name). Multi-byte / surrogate pair handling is in `readName` /
@@ -629,7 +645,7 @@ function buildXmlTagMatcher(
     if (raw.indexOf(']]>') >= 0) {
       return { err: 'cdata_terminator_in_text' }
     }
-    const ampErr = checkEntityRefs(raw, dtd)
+    const ampErr = checkEntityRefs(raw, dtd, declared, strict)
     if (ampErr) return { err: ampErr }
     // §2.11: normalise CR LF and lone CR to LF before downstream processing.
     const normalised = normaliseLineEndings(raw)
@@ -734,6 +750,15 @@ function buildXmlTagMatcher(
         let subsetEnd = -1
         while (i < src.length) {
           const ch = src[i]
+          // Skip over quoted strings so `]` and `>` inside an
+          // entity value or attribute default cannot terminate the
+          // subset prematurely.
+          if (ch === '"' || ch === "'") {
+            i++
+            while (i < src.length && src[i] !== ch) i++
+            if (i < src.length) i++
+            continue
+          }
           if (ch === '[') {
             if (depth === 0) subsetStart = i + 1
             depth++
@@ -892,7 +917,7 @@ function buildXmlTagMatcher(
           return lex.bad(charErr, valStart, i)
         }
         const dtd = (lex.ctx?.u?.dtdEntities) || {}
-        const ampErr = checkEntityRefs(rawVal, dtd)
+        const ampErr = checkEntityRefs(rawVal, dtd, declared, strict)
         if (ampErr) {
           return lex.bad(ampErr, valStart, i)
         }
@@ -980,15 +1005,23 @@ function checkChars(s: string): string {
 
 // Validate entity references in a run of character data. Returns an
 // error code on the first malformed reference, or '' if every `&`
-// in the input is part of a well-formed reference. The optional
-// `dtd` argument lets the validator accept DOCTYPE-declared entity
-// names; without it, only the syntactic form is enforced.
+// in the input is part of a well-formed reference. The `dtd` map
+// supplies DOCTYPE-declared entity names; `extra` adds named
+// entities to consider declared (typically the predefined and
+// caller-supplied entities). When `strict` is true, references to
+// unknown names trigger `bad_entity_ref`; when false (legacy mode),
+// the syntactic check still runs but unknown names pass through.
 //
 // Well-formed forms:
 //   &name;       — name must start with a NameStartChar
 //   &#nnnn;      — decimal numeric character reference
 //   &#xhhhh;     — hexadecimal numeric character reference
-function checkEntityRefs(s: string, _dtd?: Record<string, string>): string {
+function checkEntityRefs(
+  s: string,
+  dtd?: Record<string, string>,
+  extra?: Record<string, string>,
+  strict?: boolean,
+): string {
   for (let i = 0; i < s.length; i++) {
     if (s[i] !== '&') continue
     const semi = s.indexOf(';', i + 1)
@@ -1017,6 +1050,12 @@ function checkEntityRefs(s: string, _dtd?: Record<string, string>): string {
         const cp = ref.codePointAt(j)!
         if (!isNameCharCP(cp)) return 'bad_entity_ref'
         j += cp > 0xffff ? 2 : 1
+      }
+      // §4.1: in strict mode the named entity must resolve.
+      if (strict &&
+          !(extra && Object.prototype.hasOwnProperty.call(extra, ref)) &&
+          !(dtd && Object.prototype.hasOwnProperty.call(dtd, ref))) {
+        return 'undeclared_entity'
       }
     }
     i = semi
@@ -1138,6 +1177,7 @@ Xml.defaults = {
   namespaces: true,
   entities: true,
   customEntities: {},
+  strictEntities: true,
   embed: false,
 } as XmlOptions
 

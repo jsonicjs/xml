@@ -16,6 +16,7 @@ num-hex-multi	<a>&#x41;&#x42;</a>	{"name":"a","localName":"a","attributes":{},"c
 num-hex-astral	<a>&#x1F600;</a>	{"name":"a","localName":"a","attributes":{},"children":["\uD83D\uDE00"]}
 entity-in-attr	<a title="Tom &amp; Jerry"/>	{"name":"a","localName":"a","attributes":{"title":"Tom & Jerry"},"children":[]}
 num-in-attr	<a v="&#65;&#x42;"/>	{"name":"a","localName":"a","attributes":{"v":"AB"},"children":[]}
-unknown-passthrough	<a>&unknown;</a>	{"name":"a","localName":"a","attributes":{},"children":["&unknown;"]}
+unknown-rejected	<a>&unknown;</a>	ERROR:undeclared_entity
+unknown-passthrough-lenient	<a>&unknown;</a>	{"name":"a","localName":"a","attributes":{},"children":["&unknown;"]}	{"strictEntities":false}
 custom-entity	<a>&copy; 2025&nbsp;all rights</a>	{"name":"a","localName":"a","attributes":{},"children":["© 2025\u00a0all rights"]}	{"customEntities":{"nbsp":"\u00a0","copy":"©"}}
 entities-disabled	<a>&amp;</a>	{"name":"a","localName":"a","attributes":{},"children":["&amp;"]}	{"entities":false}
