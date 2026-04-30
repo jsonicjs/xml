@@ -26,7 +26,7 @@ import (
 	jsonic "github.com/jsonicjs/jsonic/go"
 )
 
-const Version = "0.1.0"
+const Version = "0.1.1"
 
 // Defaults are merged with caller-supplied options when the plugin is
 // registered via jsonic.UseDefaults.
