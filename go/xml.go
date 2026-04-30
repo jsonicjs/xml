@@ -340,7 +340,7 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 		// parser is looking for a value and sees `#XOP` or `#XSC`,
 		// push the `element` rule (backtracking by 1 so element.open
 		// can read the same token and dispatch).
-		j.Rule("val", func(rs *jsonic.RuleSpec) {
+		j.Rule("val", func(rs *jsonic.RuleSpec, _ *jsonic.Parser) {
 			rs.Open = append(rs.Open,
 				&jsonic.AltSpec{
 					S: [][]jsonic.Tin{{xopTin}},
@@ -358,7 +358,7 @@ func Xml(j *jsonic.Jsonic, options map[string]any) error {
 		// ctx.root().node is not invoked. Resolve namespaces instead
 		// when the element rule closes directly under a val rule.
 		if namespacesOn {
-			j.Rule("element", func(rs *jsonic.RuleSpec) {
+			j.Rule("element", func(rs *jsonic.RuleSpec, _ *jsonic.Parser) {
 				rs.AddBC(func(r *jsonic.Rule, ctx *jsonic.Context) {
 					if r.Parent != nil && r.Parent != jsonic.NoRule &&
 						r.Parent.Name == "val" {
